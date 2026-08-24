@@ -1,8 +1,162 @@
 ---
-- name: Test Linux Connectivity
+- name: Linux Server Health and Access Check
   hosts: all
-  gather_facts: false
+  become: true
+  gather_facts: true
 
   tasks:
-    - name: Ping all hosts
+
+    # -------------------------------------------------
+    # PING / CONNECTIVITY
+    # -------------------------------------------------
+
+    - name: Verify Ansible connectivity
       ansible.builtin.ping:
+      register: ping_result
+
+    - name: Display ping result
+      ansible.builtin.debug:
+        msg: "PING: {{ ping_result.ping }}"
+
+
+    # -------------------------------------------------
+    # HOSTNAME / OS
+    # -------------------------------------------------
+
+    - name: Display hostname
+      ansible.builtin.debug:
+        msg: "Hostname: {{ ansible_hostname }}"
+
+    - name: Display operating system
+      ansible.builtin.debug:
+        msg: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+
+    # -------------------------------------------------
+    # CPU
+    # -------------------------------------------------
+
+    - name: Display CPU information
+      ansible.builtin.debug:
+        msg:
+          - "CPU cores: {{ ansible_processor_vcpus }}"
+          - "CPU architecture: {{ ansible_architecture }}"
+          - "CPU type: {{ ansible_processor[1] | default('Unknown') }}"
+
+
+    # -------------------------------------------------
+    # MEMORY
+    # -------------------------------------------------
+
+    - name: Display memory information
+      ansible.builtin.debug:
+        msg:
+          - "Total memory: {{ ansible_memtotal_mb }} MB"
+          - "Free memory: {{ ansible_memfree_mb }} MB"
+
+
+    # -------------------------------------------------
+    # DISK
+    # -------------------------------------------------
+
+    - name: Check root filesystem
+      ansible.builtin.command: df -h /
+      register: disk_result
+      changed_when: false
+
+    - name: Display disk usage
+      ansible.builtin.debug:
+        var: disk_result.stdout
+
+
+    # -------------------------------------------------
+    # SSH SERVICE
+    # -------------------------------------------------
+
+    - name: Check SSH service
+      ansible.builtin.service_facts:
+
+    - name: Display SSH service status
+      ansible.builtin.debug:
+        msg: >-
+          SSH service status:
+          {{
+            ansible_facts.services['ssh.service'].state
+            if 'ssh.service' in ansible_facts.services
+            else
+            ansible_facts.services['sshd.service'].state
+            if 'sshd.service' in ansible_facts.services
+            else
+            'SSH service not found'
+          }}
+
+
+    # -------------------------------------------------
+    # SSH PORT
+    # -------------------------------------------------
+
+    - name: Check SSH port 22
+      ansible.builtin.wait_for:
+        port: 22
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        timeout: 5
+        state: started
+      delegate_to: localhost
+      become: false
+
+    - name: Display SSH port status
+      ansible.builtin.debug:
+        msg: "SSH port 22 is reachable"
+
+
+    # -------------------------------------------------
+    # CURRENT USER
+    # -------------------------------------------------
+
+    - name: Check current Ansible user
+      ansible.builtin.command: whoami
+      register: current_user
+      changed_when: false
+
+    - name: Display current user
+      ansible.builtin.debug:
+        msg: "Connected as: {{ current_user.stdout }}"
+
+
+    # -------------------------------------------------
+    # SUDO / PRIVILEGE ACCESS
+    # -------------------------------------------------
+
+    - name: Test sudo access
+      ansible.builtin.command: whoami
+      become: true
+      register: sudo_user
+      changed_when: false
+
+    - name: Display sudo result
+      ansible.builtin.debug:
+        msg: "Privilege escalation user: {{ sudo_user.stdout }}"
+
+
+    # -------------------------------------------------
+    # USERS
+    # -------------------------------------------------
+
+    - name: Get Linux users
+      ansible.builtin.getent:
+        database: passwd
+
+    - name: Display Linux users
+      ansible.builtin.debug:
+        msg: "Linux users: {{ ansible_facts.getent_passwd.keys() | list }}"
+
+
+    # -------------------------------------------------
+    # IMPORTANT SERVICES
+    # -------------------------------------------------
+
+    - name: Check required services
+      ansible.builtin.debug:
+        msg:
+          - "SSH: {{ 'ssh.service' in ansible_facts.services or 'sshd.service' in ansible_facts.services }}"
+          - "Nginx: {{ 'nginx.service' in ansible_facts.services }}"

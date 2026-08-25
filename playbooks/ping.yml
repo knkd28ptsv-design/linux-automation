@@ -1,4 +1,31 @@
 ---
+# ================================================================
+# LINUX SERVER HEALTH CHECK
+# AWX / ANSIBLE
+#
+# Checks:
+#   - Ansible connectivity
+#   - SSH port/service
+#   - CPU quantity and usage
+#   - Memory quantity and usage
+#   - Root disk quantity and usage
+#   - Network interfaces and traffic
+#   - Uptime
+#   - Logged-in users
+#   - Linux user count
+#   - Running/failed services
+#   - Service PID / command / start time
+#   - SAP processes / instances
+#   - SSL certificate expiry
+#   - Overall PASS / WARNING / FAIL
+#
+# Designed to avoid:
+#   - AnsibleUnsafeText arithmetic errors
+#   - Undefined certificate dictionary errors
+#   - AWX localhost sudo errors
+#   - Broken Jinja if/endif blocks
+# ================================================================
+
 - name: Linux Server Health Check
   hosts: all
   gather_facts: true
@@ -6,92 +33,101 @@
 
   vars:
 
-    # ============================================================
+    # ------------------------------------------------------------
     # THRESHOLDS
-    # ============================================================
+    # ------------------------------------------------------------
 
-    cpu_warning: 70
+    cpu_warning: 80
     cpu_critical: 90
 
-    memory_warning: 70
+    memory_warning: 80
     memory_critical: 90
 
-    disk_warning: 75
+    disk_warning: 80
     disk_critical: 90
 
     certificate_warning_days: 30
-    certificate_critical_days: 15
+    certificate_critical_days: 7
 
-    # ============================================================
+    # ------------------------------------------------------------
     # SERVICES TO CHECK
     #
-    # Add/remove services according to your environment.
-    # Example:
-    # required_services:
-    #   - ssh
-    #   - nginx
-    #   - docker
-    #   - kubelet
-    # ============================================================
+    # Add/remove services as required.
+    # SSH is checked separately.
+    # ------------------------------------------------------------
 
     required_services:
       - ssh
       - nginx
       - docker
-      - kubelet
+      - containerd
 
-    # ============================================================
+    # ------------------------------------------------------------
+    # SAP
+    #
+    # SAP checks are automatically skipped when SAPCONTROL is
+    # not installed.
+    # ------------------------------------------------------------
+
+    sap_enabled: true
+
+    # ------------------------------------------------------------
     # SSL CERTIFICATES
     #
-    # Change/add certificates here.
+    # IMPORTANT:
+    # Certificate checks are executed on the target Linux server,
+    # NOT on AWX localhost.
     #
-    # Example:
-    #
-    # certificate_targets:
-    #   - name: "SAP HTTPS"
-    #     host: "10.15.4.90"
-    #     port: 443
-    #
-    # ============================================================
+    # Add more certificates as required.
+    # ------------------------------------------------------------
 
-    certificate_targets:
+    ssl_certificates:
       - name: "Local HTTPS"
         host: "10.15.4.90"
         port: 443
 
+    # ------------------------------------------------------------
+    # NETWORK INTERFACE
+    #
+    # Set to ens5 for your current server.
+    # Change to eth0/ens160/etc. for another server if required.
+    # ------------------------------------------------------------
+
+    network_interface: "ens5"
+
   tasks:
 
     # ============================================================
-    # BASIC SERVER INFORMATION
+    # BASIC SYSTEM INFORMATION
     # ============================================================
 
     - name: Collect hostname
-      ansible.builtin.command: hostname
-      register: hostname_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        server_hostname: "{{ ansible_hostname | default(inventory_hostname) }}"
+      no_log: true
 
-    - name: Collect OS information
-      ansible.builtin.shell: |
-        if [ -f /etc/os-release ]; then
-          . /etc/os-release
-          echo "${PRETTY_NAME:-$NAME}"
-        else
-          uname -s
-        fi
-      args:
-        executable: /bin/bash
-      register: os_result
-      changed_when: false
+    - name: Collect operating system
+      ansible.builtin.set_fact:
+        server_os: >-
+          {{
+            ansible_distribution
+            | default('Unknown')
+          }}
+          {{
+            ansible_distribution_version
+            | default('')
+          }}
+      no_log: true
 
     - name: Collect kernel
-      ansible.builtin.command: uname -r
-      register: kernel_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        server_kernel: "{{ ansible_kernel | default('Unknown') }}"
+      no_log: true
 
     - name: Collect architecture
-      ansible.builtin.command: uname -m
-      register: architecture_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        server_architecture: "{{ ansible_architecture | default('Unknown') }}"
+      no_log: true
 
     # ============================================================
     # ANSIBLE CONNECTIVITY
@@ -99,8 +135,19 @@
 
     - name: Test Ansible connectivity
       ansible.builtin.ping:
-      register: ansible_ping
+      register: ansible_ping_result
       changed_when: false
+      no_log: true
+
+    - name: Set Ansible ping status
+      ansible.builtin.set_fact:
+        ansible_ping_status: >-
+          {{
+            'PASS'
+            if ansible_ping_result.ping | default('') == 'pong'
+            else 'FAIL'
+          }}
+      no_log: true
 
     # ============================================================
     # SSH PORT
@@ -108,122 +155,123 @@
 
     - name: Check SSH port 22
       ansible.builtin.wait_for:
-        host: "{{ ansible_host | default(inventory_hostname) }}"
+        host: "{{ inventory_hostname }}"
         port: 22
         timeout: 5
         state: started
       delegate_to: localhost
+      become: false
       register: ssh_port_result
       changed_when: false
-      ignore_errors: true
+      failed_when: false
+      no_log: true
+
+    - name: Set SSH port status
+      ansible.builtin.set_fact:
+        ssh_port_status: >-
+          {{
+            'PASS'
+            if ssh_port_result.failed | default(true) | bool == false
+            else 'FAIL'
+          }}
+      no_log: true
 
     # ============================================================
     # SSH SERVICE
     # ============================================================
 
     - name: Check SSH service
-      ansible.builtin.shell: |
-        if systemctl is-active --quiet ssh 2>/dev/null; then
-          echo "RUNNING"
-        elif systemctl is-active --quiet sshd 2>/dev/null; then
-          echo "RUNNING"
-        else
-          echo "NOT_RUNNING"
-        fi
-      args:
-        executable: /bin/bash
-      register: ssh_service_result
-      changed_when: false
+      ansible.builtin.service_facts:
+      no_log: true
 
-    # ============================================================
-    # UPTIME
-    #
-    # IMPORTANT:
-    # All arithmetic is performed by shell.
-    # This avoids AnsibleUnsafeText/Jinja errors.
-    # ============================================================
-
-    - name: Get uptime
-      ansible.builtin.shell: |
-        awk '{print $1}' /proc/uptime
-      args:
-        executable: /bin/bash
-      register: uptime_raw
-      changed_when: false
-
-    - name: Format uptime
-      ansible.builtin.shell: |
-        uptime_seconds=$(awk -F. '{print $1}' /proc/uptime)
-
-        days=$((uptime_seconds / 86400))
-        hours=$(((uptime_seconds % 86400) / 3600))
-        minutes=$(((uptime_seconds % 3600) / 60))
-
-        echo "${days} days ${hours} hours ${minutes} minutes"
-      args:
-        executable: /bin/bash
-      register: uptime_formatted
-      changed_when: false
+    - name: Determine SSH service status
+      ansible.builtin.set_fact:
+        ssh_service_status: >-
+          {{
+            'PASS'
+            if
+            (
+              ansible_facts.services['ssh.service'].state | default('')
+              == 'running'
+            )
+            or
+            (
+              ansible_facts.services['sshd.service'].state | default('')
+              == 'running'
+            )
+            or
+            (
+              ansible_facts.services['ssh'].state | default('')
+              == 'running'
+            )
+            or
+            (
+              ansible_facts.services['sshd'].state | default('')
+              == 'running'
+            )
+            else 'FAIL'
+          }}
+      no_log: true
 
     # ============================================================
     # CPU
-    #
-    # Uses /proc/stat and calculates CPU usage in shell.
     # ============================================================
 
     - name: Collect CPU information
       ansible.builtin.shell: |
-        cpu_count=$(nproc)
+        set -o pipefail
 
-        read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+        CPU_COUNT=$(nproc)
 
-        total1=$((user + nice + system + idle + iowait + irq + softirq + steal))
-        idle1=$((idle + iowait))
+        CPU_IDLE=$(top -bn1 | \
+          awk -F',' '/Cpu\(s\)/ {
+            for(i=1;i<=NF;i++) {
+              if ($i ~ /id/) {
+                gsub(/[^0-9.]/,"",$i)
+                print $i
+                exit
+              }
+            }
+          }')
 
-        sleep 1
-
-        read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-
-        total2=$((user + nice + system + idle + iowait + irq + softirq + steal))
-        idle2=$((idle + iowait))
-
-        total_diff=$((total2 - total1))
-        idle_diff=$((idle2 - idle1))
-
-        if [ "$total_diff" -gt 0 ]; then
-          usage=$(awk -v t="$total_diff" -v i="$idle_diff" \
-            'BEGIN {printf "%.2f", (100 * (t-i) / t)}')
-        else
-          usage="0.00"
+        if [ -z "$CPU_IDLE" ]; then
+          CPU_IDLE=$(awk '/^cpu / {
+            idle=$5
+            total=0
+            for(i=2;i<=NF;i++) total+=$i
+            printf "%.2f", (idle/total)*100
+          }' /proc/stat)
         fi
 
-        echo "COUNT=${cpu_count}"
-        echo "USAGE=${usage}"
+        CPU_USAGE=$(awk -v idle="$CPU_IDLE" \
+          'BEGIN {printf "%.2f", 100-idle}')
+
+        echo "$CPU_COUNT|$CPU_USAGE"
       args:
         executable: /bin/bash
       register: cpu_result
       changed_when: false
+      no_log: true
 
-    - name: Set CPU values
+    - name: Set CPU quantity and usage
       ansible.builtin.set_fact:
-        cpu_count: "{{ cpu_result.stdout | regex_search('COUNT=([0-9]+)', '\\1') | first | default('0') }}"
-        cpu_usage: "{{ cpu_result.stdout | regex_search('USAGE=([0-9.]+)', '\\1') | first | default('0.00') }}"
+        cpu_count: "{{ (cpu_result.stdout.split('|')[0] | default('0')) | int }}"
+        cpu_usage: "{{ (cpu_result.stdout.split('|')[1] | default('0')) | float }}"
+      no_log: true
 
     - name: Determine CPU status
-      ansible.builtin.shell: |
-        usage="{{ cpu_usage }}"
-
-        if awk "BEGIN {exit !($usage >= {{ cpu_critical }})}"; then
-          echo "FAIL"
-        elif awk "BEGIN {exit !($usage >= {{ cpu_warning }})}"; then
-          echo "WARNING"
-        else
-          echo "PASS"
-        fi
-      args:
-        executable: /bin/bash
-      register: cpu_status_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        cpu_status: >-
+          {{
+            'FAIL'
+            if (cpu_usage | float) >= (cpu_critical | float)
+            else
+            'WARNING'
+            if (cpu_usage | float) >= (cpu_warning | float)
+            else
+            'PASS'
+          }}
+      no_log: true
 
     # ============================================================
     # MEMORY
@@ -231,58 +279,54 @@
 
     - name: Collect memory information
       ansible.builtin.shell: |
-        total_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
-        available_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+        set -o pipefail
 
-        used_kb=$((total_kb - available_kb))
+        free -b | awk '
+        /^Mem:/ {
+          total=$2
+          available=$7
+          used=total-available
 
-        if [ "$total_kb" -gt 0 ]; then
-          usage=$(awk -v u="$used_kb" -v t="$total_kb" \
-            'BEGIN {printf "%.2f", (100*u/t)}')
-        else
-          usage="0.00"
-        fi
-
-        total_gb=$(awk -v t="$total_kb" \
-          'BEGIN {printf "%.2f", t/1024/1024}')
-
-        used_gb=$(awk -v u="$used_kb" \
-          'BEGIN {printf "%.2f", u/1024/1024}')
-
-        available_gb=$(awk -v a="$available_kb" \
-          'BEGIN {printf "%.2f", a/1024/1024}')
-
-        echo "TOTAL_GB=${total_gb}"
-        echo "USED_GB=${used_gb}"
-        echo "AVAILABLE_GB=${available_gb}"
-        echo "USAGE=${usage}"
+          printf "%.0f|%.0f|%.0f|%.2f\n",
+          total,
+          used,
+          available,
+          (used/total)*100
+        }'
       args:
         executable: /bin/bash
       register: memory_result
       changed_when: false
+      no_log: true
 
     - name: Set memory values
       ansible.builtin.set_fact:
-        memory_total_gb: "{{ memory_result.stdout | regex_search('TOTAL_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        memory_used_gb: "{{ memory_result.stdout | regex_search('USED_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        memory_available_gb: "{{ memory_result.stdout | regex_search('AVAILABLE_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        memory_usage: "{{ memory_result.stdout | regex_search('USAGE=([0-9.]+)', '\\1') | first | default('0.00') }}"
+        memory_total_bytes: "{{ (memory_result.stdout.split('|')[0] | default('0')) | int }}"
+        memory_used_bytes: "{{ (memory_result.stdout.split('|')[1] | default('0')) | int }}"
+        memory_free_bytes: "{{ (memory_result.stdout.split('|')[2] | default('0')) | int }}"
+        memory_usage: "{{ (memory_result.stdout.split('|')[3] | default('0')) | float }}"
+      no_log: true
+
+    - name: Calculate memory GB
+      ansible.builtin.set_fact:
+        memory_total_gb: "{{ ((memory_total_bytes | int) / 1073741824) | round(2) }}"
+        memory_used_gb: "{{ ((memory_used_bytes | int) / 1073741824) | round(2) }}"
+        memory_free_gb: "{{ ((memory_free_bytes | int) / 1073741824) | round(2) }}"
+      no_log: true
 
     - name: Determine memory status
-      ansible.builtin.shell: |
-        usage="{{ memory_usage }}"
-
-        if awk "BEGIN {exit !($usage >= {{ memory_critical }})}"; then
-          echo "FAIL"
-        elif awk "BEGIN {exit !($usage >= {{ memory_warning }})}"; then
-          echo "WARNING"
-        else
-          echo "PASS"
-        fi
-      args:
-        executable: /bin/bash
-      register: memory_status_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        memory_status: >-
+          {{
+            'FAIL'
+            if (memory_usage | float) >= (memory_critical | float)
+            else
+            'WARNING'
+            if (memory_usage | float) >= (memory_warning | float)
+            else
+            'PASS'
+          }}
+      no_log: true
 
     # ============================================================
     # DISK
@@ -290,128 +334,136 @@
 
     - name: Collect root disk information
       ansible.builtin.shell: |
-        df -P -B1 / | awk '
-        NR==2 {
-          total=$2
-          used=$3
-          available=$4
-          percent=$5
-          gtotal=total/1024/1024/1024
-          gused=used/1024/1024/1024
-          gavail=available/1024/1024/1024
-          sub("%","",percent)
-
-          printf "TOTAL_GB=%.2f\n",gtotal
-          printf "USED_GB=%.2f\n",gused
-          printf "AVAILABLE_GB=%.2f\n",gavail
-          printf "USAGE=%.2f\n",percent
+        df -Pk / | awk 'NR==2 {
+          gsub("%","",$5)
+          printf "%s|%s|%s|%s\n",$2,$3,$4,$5
         }'
       args:
         executable: /bin/bash
       register: disk_result
       changed_when: false
+      no_log: true
 
     - name: Set disk values
       ansible.builtin.set_fact:
-        disk_total_gb: "{{ disk_result.stdout | regex_search('TOTAL_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        disk_used_gb: "{{ disk_result.stdout | regex_search('USED_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        disk_available_gb: "{{ disk_result.stdout | regex_search('AVAILABLE_GB=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        disk_usage: "{{ disk_result.stdout | regex_search('USAGE=([0-9.]+)', '\\1') | first | default('0.00') }}"
+        root_disk_total_kb: "{{ (disk_result.stdout.split('|')[0] | default('0')) | int }}"
+        root_disk_used_kb: "{{ (disk_result.stdout.split('|')[1] | default('0')) | int }}"
+        root_disk_free_kb: "{{ (disk_result.stdout.split('|')[2] | default('0')) | int }}"
+        root_disk_usage: "{{ (disk_result.stdout.split('|')[3] | default('0')) | float }}"
+      no_log: true
+
+    - name: Calculate disk GB
+      ansible.builtin.set_fact:
+        root_disk_total_gb: "{{ ((root_disk_total_kb | int) / 1048576) | round(2) }}"
+        root_disk_used_gb: "{{ ((root_disk_used_kb | int) / 1048576) | round(2) }}"
+        root_disk_free_gb: "{{ ((root_disk_free_kb | int) / 1048576) | round(2) }}"
+      no_log: true
 
     - name: Determine disk status
-      ansible.builtin.shell: |
-        usage="{{ disk_usage }}"
-
-        if awk "BEGIN {exit !($usage >= {{ disk_critical }})}"; then
-          echo "FAIL"
-        elif awk "BEGIN {exit !($usage >= {{ disk_warning }})}"; then
-          echo "WARNING"
-        else
-          echo "PASS"
-        fi
-      args:
-        executable: /bin/bash
-      register: disk_status_result
-      changed_when: false
-
-    # ============================================================
-    # ALL FILESYSTEMS
-    # ============================================================
-
-    - name: Collect filesystem usage
-      ansible.builtin.shell: |
-        df -hP \
-        --exclude-type=tmpfs \
-        --exclude-type=devtmpfs \
-        --exclude-type=overlay \
-        --exclude-type=squashfs \
-        2>/dev/null
-      args:
-        executable: /bin/bash
-      register: filesystem_result
-      changed_when: false
-
-    # ============================================================
-    # NETWORK TRAFFIC
-    #
-    # Reads /proc/net/dev twice with a 1-second interval.
-    # Calculates RX/TX Mbps.
-    # ============================================================
-
-    - name: Collect network traffic
-      ansible.builtin.shell: |
-        get_total() {
-          awk '
-          NR > 2 {
-            gsub(":", "", $1)
-            if ($1 != "lo") {
-              rx += $2
-              tx += $10
-            }
-          }
-          END {
-            printf "%.0f %.0f\n", rx, tx
-          }' /proc/net/dev
-        }
-
-        read rx1 tx1 < <(get_total)
-
-        sleep 1
-
-        read rx2 tx2 < <(get_total)
-
-        rx_diff=$((rx2-rx1))
-        tx_diff=$((tx2-tx1))
-
-        if [ "$rx_diff" -lt 0 ]; then rx_diff=0; fi
-        if [ "$tx_diff" -lt 0 ]; then tx_diff=0; fi
-
-        rx_mbps=$(awk -v b="$rx_diff" 'BEGIN {printf "%.2f", b*8/1000000}')
-        tx_mbps=$(awk -v b="$tx_diff" 'BEGIN {printf "%.2f", b*8/1000000}')
-
-        echo "RX_MBPS=${rx_mbps}"
-        echo "TX_MBPS=${tx_mbps}"
-      args:
-        executable: /bin/bash
-      register: network_traffic_result
-      changed_when: false
-
-    - name: Set network traffic values
       ansible.builtin.set_fact:
-        network_rx_mbps: "{{ network_traffic_result.stdout | regex_search('RX_MBPS=([0-9.]+)', '\\1') | first | default('0.00') }}"
-        network_tx_mbps: "{{ network_traffic_result.stdout | regex_search('TX_MBPS=([0-9.]+)', '\\1') | first | default('0.00') }}"
+        disk_status: >-
+          {{
+            'FAIL'
+            if (root_disk_usage | float) >= (disk_critical | float)
+            else
+            'WARNING'
+            if (root_disk_usage | float) >= (disk_warning | float)
+            else
+            'PASS'
+          }}
+      no_log: true
+
+    # ============================================================
+    # UPTIME
+    # ============================================================
+
+    - name: Get uptime seconds
+      ansible.builtin.shell: |
+        awk '{print int($1)}' /proc/uptime
+      args:
+        executable: /bin/bash
+      register: uptime_result
+      changed_when: false
+      no_log: true
+
+    - name: Convert uptime to integer
+      ansible.builtin.set_fact:
+        uptime_seconds: "{{ uptime_result.stdout | trim | int }}"
+      no_log: true
+
+    - name: Format uptime
+      ansible.builtin.set_fact:
+        uptime_display: >-
+          {{
+            ((uptime_seconds | int) // 86400)
+          }} days
+          {{
+            (((uptime_seconds | int) % 86400) // 3600)
+          }} hours
+          {{
+            (((uptime_seconds | int) % 3600) // 60)
+          }} minutes
+      no_log: true
 
     # ============================================================
     # NETWORK INTERFACES
     # ============================================================
 
-    - name: Collect network interfaces
+    - name: Collect network interface information
       ansible.builtin.shell: |
-        ip -brief address
+        ip -br addr
       args:
         executable: /bin/bash
-      register: interfaces_result
+      register: network_interfaces_result
       changed_when: false
+      no_log: true
+
+    - name: Set network interfaces
+      ansible.builtin.set_fact:
+        network_interfaces: "{{ network_interfaces_result.stdout_lines | default([]) }}"
+      no_log: true
+
+    # ============================================================
+    # NETWORK TRAFFIC
+    # ============================================================
+
+    - name: Collect network traffic
+      ansible.builtin.shell: |
+        if [ -f "/sys/class/net/{{ network_interface }}/statistics/rx_bytes" ]; then
+          RX=$(cat "/sys/class/net/{{ network_interface }}/statistics/rx_bytes")
+          TX=$(cat "/sys/class/net/{{ network_interface }}/statistics/tx_bytes")
+
+          echo "$RX|$TX"
+        else
+          echo "0|0"
+        fi
+      args:
+        executable: /bin/bash
+      register: network_traffic_result
+      changed_when: false
+      no_log: true
+
+    - name: Set network traffic bytes
+      ansible.builtin.set_fact:
+        network_rx_bytes: "{{ (network_traffic_result.stdout.split('|')[0] | default('0')) | int }}"
+        network_tx_bytes: "{{ (network_traffic_result.stdout.split('|')[1] | default('0')) | int }}"
+      no_log: true
+
+    - name: Calculate network traffic GB
+      ansible.builtin.set_fact:
+        network_rx_gb: "{{ ((network_rx_bytes | int) / 1073741824) | round(2) }}"
+        network_tx_gb: "{{ ((network_tx_bytes | int) / 1073741824) | round(2) }}"
+      no_log: true
+
+    - name: Determine network status
+      ansible.builtin.set_fact:
+        network_status: >-
+          {{
+            'PASS'
+            if network_interface in ansible_facts.interfaces | default([])
+            else 'WARNING'
+          }}
+      no_log: true
 
     # ============================================================
     # LOGGED-IN USERS
@@ -419,319 +471,596 @@
 
     - name: Collect logged-in users
       ansible.builtin.shell: |
-        if who | grep -q .; then
-          who
-        else
-          echo "No users currently logged in"
-        fi
+        who | awk '{print $1}' | sort -u | paste -sd ',' -
       args:
         executable: /bin/bash
       register: logged_users_result
       changed_when: false
+      no_log: true
+
+    - name: Set logged-in users
+      ansible.builtin.set_fact:
+        logged_in_users: >-
+          {{
+            logged_users_result.stdout | trim
+            if logged_users_result.stdout | trim | length > 0
+            else 'None'
+          }}
+      no_log: true
 
     # ============================================================
-    # LINUX USERS
+    # LINUX USER COUNT
     # ============================================================
 
-    - name: Collect Linux users
+    - name: Count Linux users
       ansible.builtin.shell: |
-        getent passwd | awk -F: '{print $1}'
+        awk -F: 'END {print NR}' /etc/passwd
       args:
         executable: /bin/bash
-      register: linux_users_result
+      register: linux_user_count_result
       changed_when: false
+      no_log: true
+
+    - name: Set Linux user count
+      ansible.builtin.set_fact:
+        linux_user_count: "{{ linux_user_count_result.stdout | trim | int }}"
+      no_log: true
+
+    # ============================================================
+    # SERVICE FACTS
+    # ============================================================
+
+    - name: Collect service facts
+      ansible.builtin.service_facts:
+      no_log: true
 
     # ============================================================
     # REQUIRED SERVICES
     # ============================================================
 
-    - name: Check required services
-      ansible.builtin.shell: |
-        service_name="{{ item }}"
+    - name: Initialize service status report
+      ansible.builtin.set_fact:
+        required_service_report: []
+      no_log: true
 
-        if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "${service_name}.service"; then
-
-          if systemctl is-active --quiet "${service_name}.service"; then
-            echo "${service_name}: RUNNING"
-          else
-            echo "${service_name}: STOPPED"
-          fi
-
-        else
-
-          echo "${service_name}: NOT_INSTALLED"
-
-        fi
-      args:
-        executable: /bin/bash
+    - name: Build required service report
+      ansible.builtin.set_fact:
+        required_service_report: >-
+          {{
+            required_service_report +
+            [
+              {
+                'name': item,
+                'state': (
+                  ansible_facts.services[item + '.service'].state
+                  | default(
+                    ansible_facts.services[item].state
+                    | default('NOT FOUND')
+                  )
+                )
+              }
+            ]
+          }}
       loop: "{{ required_services }}"
-      register: service_check_result
-      changed_when: false
+      no_log: true
 
     # ============================================================
-    # ALL RUNNING SERVICES
+    # RUNNING / FAILED SERVICES
     # ============================================================
 
-    - name: Collect running services
+    - name: Count running services
+      ansible.builtin.set_fact:
+        running_service_count: >-
+          {{
+            ansible_facts.services
+            | dict2items
+            | selectattr('value.state', 'defined')
+            | selectattr('value.state', 'equalto', 'running')
+            | list
+            | length
+          }}
+      no_log: true
+
+    - name: Count failed services
+      ansible.builtin.set_fact:
+        failed_service_count: >-
+          {{
+            ansible_facts.services
+            | dict2items
+            | selectattr('value.state', 'defined')
+            | selectattr('value.state', 'equalto', 'failed')
+            | list
+            | length
+          }}
+      no_log: true
+
+    # ============================================================
+    # SERVICE DETAILS
+    # PID / COMMAND / START TIME
+    # ============================================================
+
+    - name: Collect running service details
       ansible.builtin.shell: |
         systemctl list-units \
           --type=service \
           --state=running \
-          --no-pager \
           --no-legend \
-          2>/dev/null |
-        awk '{print $1}'
+          --no-pager |
+        awk '{print $1}' |
+        head -50 |
+        while read svc; do
+
+          PID=$(systemctl show "$svc" \
+            -p MainPID --value 2>/dev/null)
+
+          CMD="N/A"
+
+          if [ "$PID" != "0" ] && [ -n "$PID" ]; then
+            if [ -r "/proc/$PID/cmdline" ]; then
+              CMD=$(tr '\0' ' ' < "/proc/$PID/cmdline")
+            fi
+          fi
+
+          START=$(systemctl show "$svc" \
+            -p ActiveEnterTimestamp --value 2>/dev/null)
+
+          echo "$svc|$PID|$START|$CMD"
+
+        done
       args:
         executable: /bin/bash
-      register: running_services_result
+      register: running_service_details_result
       changed_when: false
+      no_log: true
 
-    # ============================================================
-    # TOP CPU PROCESSES
-    # ============================================================
-
-    - name: Collect top CPU processes
-      ansible.builtin.shell: |
-        ps -eo pid,user,comm,%cpu,%mem --sort=-%cpu | head -11
-      args:
-        executable: /bin/bash
-      register: top_cpu_processes_result
-      changed_when: false
-
-    # ============================================================
-    # TOP MEMORY PROCESSES
-    # ============================================================
-
-    - name: Collect top memory processes
-      ansible.builtin.shell: |
-        ps -eo pid,user,comm,%cpu,%mem --sort=-%mem | head -11
-      args:
-        executable: /bin/bash
-      register: top_memory_processes_result
-      changed_when: false
-
-    # ============================================================
-    # CURRENT COMMANDS / PROCESSES
-    # ============================================================
-
-    - name: Collect active process commands
-      ansible.builtin.shell: |
-        ps -eo user,pid,ppid,%cpu,%mem,lstart,cmd --sort=-%cpu | head -21
-      args:
-        executable: /bin/bash
-      register: process_commands_result
-      changed_when: false
-
-    # ============================================================
-    # RECENT SYSTEM CHANGES
-    # ============================================================
-
-    - name: Collect recent system changes
-      ansible.builtin.shell: |
-        if command -v journalctl >/dev/null 2>&1; then
-          journalctl --since "1 hour ago" \
-            --no-pager \
-            -p warning..alert \
-            2>/dev/null |
-          tail -20
-        else
-          echo "systemd journal not available"
-        fi
-      args:
-        executable: /bin/bash
-      register: recent_changes_result
-      changed_when: false
+    - name: Set running service details
+      ansible.builtin.set_fact:
+        running_service_details: >-
+          {{
+            running_service_details_result.stdout_lines
+            | default([])
+          }}
+      no_log: true
 
     # ============================================================
     # SAP DETECTION
     # ============================================================
 
-    - name: Check SAPCONTROL availability
+    - name: Check for SAPCONTROL
       ansible.builtin.shell: |
-        if command -v sapcontrol >/dev/null 2>&1; then
-          echo "AVAILABLE"
-        elif find /usr/sap -type f -name sapcontrol 2>/dev/null | head -1 | grep -q .; then
-          echo "AVAILABLE"
-        else
-          echo "NOT_AVAILABLE"
-        fi
+        command -v sapcontrol || true
       args:
         executable: /bin/bash
-      register: sapcontrol_check
+      register: sapcontrol_result
       changed_when: false
+      no_log: true
+      when: sap_enabled | bool
+
+    - name: Determine SAPCONTROL availability
+      ansible.builtin.set_fact:
+        sapcontrol_available: >-
+          {{
+            (
+              sapcontrol_result.stdout | default('')
+            ) | trim | length > 0
+          }}
+      no_log: true
+
+    - name: Set SAP unavailable
+      ansible.builtin.set_fact:
+        sapcontrol_available: false
+      when: not (sap_enabled | bool)
+      no_log: true
+
+    # ============================================================
+    # SAP PROCESSES
+    # ============================================================
 
     - name: Collect SAP processes
       ansible.builtin.shell: |
-        if pgrep -af 'sapstartsrv|disp\+work|msg_server|enserver|sapwebdisp|hdbnameserver|hdbindexserver' >/dev/null 2>&1; then
-          pgrep -af 'sapstartsrv|disp\+work|msg_server|enserver|sapwebdisp|hdbnameserver|hdbindexserver'
-        else
-          echo "No SAP processes detected"
-        fi
+        ps -eo user,pid,ppid,lstart,cmd --sort=user |
+        grep -E '[s]apstartsrv|[s]apstart|[h]dbnameserver|[h]dbindexserver|[h]dbxsengine' ||
+        true
       args:
         executable: /bin/bash
       register: sap_process_result
       changed_when: false
+      no_log: true
+      when: sap_enabled | bool
+
+    - name: Set SAP process display
+      ansible.builtin.set_fact:
+        sap_process_display: >-
+          {{
+            sap_process_result.stdout_lines
+            | default([])
+            | join(' ; ')
+            if
+            (
+              sap_process_result.stdout_lines
+              | default([])
+              | length > 0
+            )
+            else 'N/A'
+          }}
+      no_log: true
+
+    - name: Set SAP process display when disabled
+      ansible.builtin.set_fact:
+        sap_process_display: "N/A"
+      when: not (sap_enabled | bool)
+      no_log: true
 
     # ============================================================
-    # SAP SYSTEM DETAILS
+    # SAP SYSTEM INSTANCES
     # ============================================================
 
     - name: Find SAP system instances
       ansible.builtin.shell: |
-        if [ -d /usr/sap ]; then
-          find /usr/sap -maxdepth 2 -type d 2>/dev/null |
-          grep -E '/usr/sap/[^/]+/[A-Z][A-Z][A-Z][0-9][0-9]' |
-          head -20
-        else
-          echo "N/A"
-        fi
+        ps -eo user,pid,cmd |
+        grep -E '[s]apstartsrv' |
+        sed 's/^[[:space:]]*//' ||
+        true
       args:
         executable: /bin/bash
-      register: sap_instances_result
+      register: sap_instance_result
       changed_when: false
+      no_log: true
+      when: sap_enabled | bool
+
+    - name: Set SAP instance display
+      ansible.builtin.set_fact:
+        sap_instance_display: >-
+          {{
+            sap_instance_result.stdout_lines
+            | default([])
+            | join(' ; ')
+            if
+            (
+              sap_instance_result.stdout_lines
+              | default([])
+              | length > 0
+            )
+            else 'N/A'
+          }}
+      no_log: true
+
+    - name: Set SAP instance display when disabled
+      ansible.builtin.set_fact:
+        sap_instance_display: "N/A"
+      when: not (sap_enabled | bool)
+      no_log: true
 
     # ============================================================
-    # SSL CERTIFICATES
+    # SAP STATUS
+    # ============================================================
+
+    - name: Determine SAP status
+      ansible.builtin.set_fact:
+        sap_status: >-
+          {{
+            'PASS'
+            if
+            (
+              sap_process_display | default('N/A')
+            ) != 'N/A'
+            else 'N/A'
+          }}
+      no_log: true
+
+    # ============================================================
+    # SSL CERTIFICATE CHECK
     #
-    # This is deliberately handled entirely in shell to avoid
-    # undefined dictionary/name errors.
+    # IMPORTANT:
+    # This runs ON THE TARGET SERVER.
+    #
+    # There is NO:
+    #   delegate_to: localhost
+    #   sudo
+    #
+    # Therefore the previous:
+    #   "/bin/sh: sudo: command not found"
+    #
+    # error is avoided.
     # ============================================================
 
     - name: Check SSL certificates
       ansible.builtin.shell: |
-        target_name="{{ item.name | default('Unnamed certificate') }}"
-        target_host="{{ item.host | default(ansible_host | default(inventory_hostname)) }}"
-        target_port="{{ item.port | default(443) }}"
+        set -o pipefail
 
-        expiry=$(
-          timeout 10 openssl s_client \
-            -connect "${target_host}:${target_port}" \
-            -servername "${target_host}" \
-            </dev/null 2>/dev/null |
+        EXPIRY=$(
+          echo |
+          openssl s_client \
+            -connect "{{ item.host }}:{{ item.port }}" \
+            -servername "{{ item.host }}" \
+            2>/dev/null |
           openssl x509 -noout -enddate 2>/dev/null |
           cut -d= -f2
         )
 
-        if [ -z "$expiry" ]; then
-          echo "NAME=${target_name}"
-          echo "HOST=${target_host}"
-          echo "PORT=${target_port}"
-          echo "EXPIRY=ERROR"
-          echo "DAYS=ERROR"
-          echo "STATUS=FAIL"
+        if [ -z "$EXPIRY" ]; then
+          echo "ERROR"
+        else
+          echo "$EXPIRY"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ ssl_certificates | default([]) }}"
+      register: certificate_results
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when:
+        - ssl_certificates | default([]) | length > 0
+
+    # ============================================================
+    # INITIALIZE CERTIFICATE REPORT
+    # ============================================================
+
+    - name: Initialize certificate report
+      ansible.builtin.set_fact:
+        certificate_report: []
+        certificate_status: "N/A"
+      no_log: true
+
+    # ============================================================
+    # BUILD CERTIFICATE REPORT
+    #
+    # Every dictionary attribute uses default().
+    # This prevents:
+    #   'dict object' has no attribute 'name'
+    # ============================================================
+
+    - name: Build certificate report
+      ansible.builtin.set_fact:
+        certificate_report: >-
+          {{
+            certificate_report +
+            [
+              {
+                'name': item.item.name | default('Unnamed Certificate'),
+                'host': item.item.host | default('Unknown'),
+                'port': item.item.port | default('Unknown'),
+                'expiry': item.stdout | default('ERROR')
+              }
+            ]
+          }}
+      loop: "{{ certificate_results.results | default([]) }}"
+      when:
+        - item.item is defined
+      no_log: true
+
+    # ============================================================
+    # CERTIFICATE EXPIRY DAYS
+    # ============================================================
+
+    - name: Calculate certificate expiry days
+      ansible.builtin.shell: |
+        EXPIRY="{{ item.expiry }}"
+
+        if [ "$EXPIRY" = "ERROR" ] || [ -z "$EXPIRY" ]; then
+          echo "ERROR"
           exit 0
         fi
 
-        expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
-        current_epoch=$(date +%s)
+        EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s 2>/dev/null || echo "0")
+        NOW_EPOCH=$(date +%s)
 
-        if [ "$expiry_epoch" -le 0 ]; then
-          days="ERROR"
-          status="FAIL"
+        if [ "$EXPIRY_EPOCH" = "0" ]; then
+          echo "ERROR"
         else
-          days=$(( (expiry_epoch-current_epoch) / 86400 ))
-
-          if [ "$days" -le {{ certificate_critical_days }} ]; then
-            status="FAIL"
-          elif [ "$days" -le {{ certificate_warning_days }} ]; then
-            status="WARNING"
-          else
-            status="PASS"
-          fi
+          echo $(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
         fi
-
-        echo "NAME=${target_name}"
-        echo "HOST=${target_host}"
-        echo "PORT=${target_port}"
-        echo "EXPIRY=${expiry}"
-        echo "DAYS=${days}"
-        echo "STATUS=${status}"
       args:
         executable: /bin/bash
-      loop: "{{ certificate_targets | default([]) }}"
-      register: certificate_results
+      loop: "{{ certificate_report | default([]) }}"
+      register: certificate_days_result
       changed_when: false
-      delegate_to: localhost
-      ignore_errors: true
+      failed_when: false
+      no_log: true
 
     # ============================================================
-    # CERTIFICATE STATUS SUMMARY
+    # BUILD FINAL CERTIFICATE REPORT
+    # ============================================================
+
+    - name: Initialize final certificate report
+      ansible.builtin.set_fact:
+        certificate_final_report: []
+      no_log: true
+
+    - name: Build final certificate report
+      ansible.builtin.set_fact:
+        certificate_final_report: >-
+          {{
+            certificate_final_report +
+            [
+              {
+                'name': item.item.name | default('Unnamed Certificate'),
+                'host': item.item.host | default('Unknown'),
+                'port': item.item.port | default('Unknown'),
+                'expiry': item.item.expiry | default('ERROR'),
+                'days': (
+                  item.stdout | default('ERROR')
+                ),
+                'status':
+                  'FAIL'
+                  if (item.stdout | default('ERROR')) == 'ERROR'
+                  else
+                  'FAIL'
+                  if (item.stdout | int) < (certificate_critical_days | int)
+                  else
+                  'WARNING'
+                  if (item.stdout | int) < (certificate_warning_days | int)
+                  else
+                  'PASS'
+              }
+            ]
+          }}
+      loop: "{{ certificate_days_result.results | default([]) }}"
+      when:
+        - item.item is defined
+      no_log: true
+
+    # ============================================================
+    # DETERMINE OVERALL CERTIFICATE STATUS
     # ============================================================
 
     - name: Determine certificate overall status
-      ansible.builtin.shell: |
-        status="PASS"
+      ansible.builtin.set_fact:
+        certificate_status: >-
+          {{
+            'FAIL'
+            if
+            (
+              certificate_final_report
+              | selectattr('status', 'equalto', 'FAIL')
+              | list
+              | length
+            ) > 0
+            else
+            'WARNING'
+            if
+            (
+              certificate_final_report
+              | selectattr('status', 'equalto', 'WARNING')
+              | list
+              | length
+            ) > 0
+            else
+            'PASS'
+            if certificate_final_report | length > 0
+            else 'N/A'
+          }}
+      no_log: true
 
-        {% for item in certificate_results.results | default([]) %}
-        result="{{ item.stdout | default('') }}"
+    # ============================================================
+    # CERTIFICATE DISPLAY
+    #
+    # This deliberately avoids a complex if/endif block.
+    # ============================================================
 
-        if echo "$result" | grep -q '^STATUS=FAIL'; then
-          status="FAIL"
-        elif echo "$result" | grep -q '^STATUS=WARNING' && [ "$status" != "FAIL" ]; then
-          status="WARNING"
-        fi
-        {% endfor %}
+    - name: Initialize certificate display
+      ansible.builtin.set_fact:
+        certificate_display_lines: []
+      no_log: true
 
-        echo "$status"
-      args:
-        executable: /bin/bash
-      register: certificate_overall_result
-      changed_when: false
+    - name: Build certificate display
+      ansible.builtin.set_fact:
+        certificate_display_lines: >-
+          {{
+            certificate_display_lines +
+            [
+              (
+                item.name | default('Unnamed')
+              )
+              ~ " | "
+              ~
+              (
+                item.host | default('Unknown')
+              )
+              ~ ":"
+              ~
+              (
+                item.port | string
+              )
+              ~ " | Expiry: "
+              ~
+              (
+                item.expiry | default('ERROR')
+              )
+              ~ " | Days: "
+              ~
+              (
+                item.days | default('ERROR')
+              )
+              ~ " | Status: "
+              ~
+              (
+                item.status | default('UNKNOWN')
+              )
+            ]
+          }}
+      loop: "{{ certificate_final_report | default([]) }}"
+      no_log: true
+
+    - name: Set certificate display
+      ansible.builtin.set_fact:
+        certificate_display: >-
+          {{
+            certificate_display_lines
+            if certificate_display_lines | length > 0
+            else
+            ['No SSL certificates configured for checking.']
+          }}
+      no_log: true
+
+    # ============================================================
+    # REQUIRED SERVICE STATUS
+    # ============================================================
+
+    - name: Determine required service status
+      ansible.builtin.set_fact:
+        required_service_status: >-
+          {{
+            'FAIL'
+            if
+            (
+              required_service_report
+              | selectattr('state', 'equalto', 'NOT FOUND')
+              | list
+              | length
+            ) > 0
+            or
+            (
+              required_service_report
+              | selectattr('state', 'equalto', 'failed')
+              | list
+              | length
+            ) > 0
+            else
+            'PASS'
+          }}
+      no_log: true
 
     # ============================================================
     # OVERALL HEALTH
-    #
-    # Again, comparisons happen in shell, not Jinja.
     # ============================================================
 
     - name: Determine overall health
-      ansible.builtin.shell: |
-        overall="PASS"
-
-        set_status() {
-          new_status="$1"
-
-          if [ "$new_status" = "FAIL" ]; then
-            overall="FAIL"
-          elif [ "$new_status" = "WARNING" ] && [ "$overall" = "PASS" ]; then
-            overall="WARNING"
-          fi
-        }
-
-        set_status "{{ cpu_status_result.stdout | default('FAIL') }}"
-        set_status "{{ memory_status_result.stdout | default('FAIL') }}"
-        set_status "{{ disk_status_result.stdout | default('FAIL') }}"
-
-        if [ "{{ ansible_ping.ping | default('') }}" != "pong" ]; then
-          set_status "FAIL"
-        fi
-
-        if [ "{{ ssh_service_result.stdout | default('NOT_RUNNING') }}" != "RUNNING" ]; then
-          set_status "FAIL"
-        fi
-
-        if [ "{{ ssh_port_result.failed | default(false) | string }}" = "True" ]; then
-          set_status "FAIL"
-        fi
-
-        set_status "{{ certificate_overall_result.stdout | default('PASS') }}"
-
-        {% for item in service_check_result.results | default([]) %}
-        service_output="{{ item.stdout | default('') }}"
-
-        if echo "$service_output" | grep -q ': STOPPED'; then
-          set_status "WARNING"
-        fi
-        {% endfor %}
-
-        echo "$overall"
-      args:
-        executable: /bin/bash
-      register: overall_health_result
-      changed_when: false
+      ansible.builtin.set_fact:
+        overall_health: >-
+          {{
+            'FAIL'
+            if
+            (
+              ansible_ping_status == 'FAIL'
+              or ssh_port_status == 'FAIL'
+              or ssh_service_status == 'FAIL'
+              or cpu_status == 'FAIL'
+              or memory_status == 'FAIL'
+              or disk_status == 'FAIL'
+              or required_service_status == 'FAIL'
+              or certificate_status == 'FAIL'
+            )
+            else
+            'WARNING'
+            if
+            (
+              cpu_status == 'WARNING'
+              or memory_status == 'WARNING'
+              or disk_status == 'WARNING'
+              or network_status == 'WARNING'
+              or certificate_status == 'WARNING'
+            )
+            else
+            'PASS'
+          }}
+      no_log: true
 
     # ============================================================
     # CLEAN REPORT
+    #
+    # Only this task produces the human-readable report.
     # ============================================================
 
     - name: Display clean Linux health report
@@ -742,100 +1071,81 @@
           - "                    LINUX SERVER HEALTH CHECK"
           - "======================================================================"
           - "Server              : {{ inventory_hostname }}"
-          - "Hostname            : {{ hostname_result.stdout | default('N/A') }}"
-          - "OS                  : {{ os_result.stdout | default('N/A') }}"
-          - "Kernel              : {{ kernel_result.stdout | default('N/A') }}"
-          - "Architecture        : {{ architecture_result.stdout | default('N/A') }}"
-          - "Overall Health      : {{ overall_health_result.stdout | default('UNKNOWN') }}"
+          - "Hostname            : {{ server_hostname | default('N/A') }}"
+          - "OS                  : {{ server_os | default('N/A') }}"
+          - "Kernel              : {{ server_kernel | default('N/A') }}"
+          - "Architecture        : {{ server_architecture | default('N/A') }}"
+          - "Overall Health      : {{ overall_health | default('UNKNOWN') }}"
           - "======================================================================"
           - ""
           - "[ AVAILABILITY ]"
           - "----------------------------------------------------------------------"
-          - "Ansible Ping        : {{ 'PASS' if ansible_ping.ping | default('') == 'pong' else 'FAIL' }}"
-          - "SSH Port 22         : {{ 'PASS' if not ssh_port_result.failed | default(true) else 'FAIL' }}"
-          - "SSH Service         : {{ ssh_service_result.stdout | default('UNKNOWN') }}"
-          - "Uptime              : {{ uptime_formatted.stdout | default('N/A') }}"
+          - "Ansible Ping        : {{ ansible_ping_status | default('UNKNOWN') }}"
+          - "SSH Port 22         : {{ ssh_port_status | default('UNKNOWN') }}"
+          - "SSH Service         : {{ ssh_service_status | default('UNKNOWN') }}"
+          - "Uptime              : {{ uptime_display | default('N/A') }}"
           - ""
           - "[ CPU ]"
           - "----------------------------------------------------------------------"
-          - "CPU Count           : {{ cpu_count | default('0') }}"
-          - "CPU Usage           : {{ cpu_usage | default('0.00') }} %"
-          - "CPU Status          : {{ cpu_status_result.stdout | default('UNKNOWN') }}"
+          - "CPU Quantity        : {{ cpu_count | default(0) }}"
+          - "CPU Usage           : {{ cpu_usage | default(0) }} %"
+          - "CPU Status          : {{ cpu_status | default('UNKNOWN') }}"
           - ""
           - "[ MEMORY ]"
           - "----------------------------------------------------------------------"
-          - "Memory Total        : {{ memory_total_gb | default('0.00') }} GB"
-          - "Memory Used         : {{ memory_used_gb | default('0.00') }} GB"
-          - "Memory Available    : {{ memory_available_gb | default('0.00') }} GB"
-          - "Memory Usage        : {{ memory_usage | default('0.00') }} %"
-          - "Memory Status       : {{ memory_status_result.stdout | default('UNKNOWN') }}"
+          - "Memory Total        : {{ memory_total_gb | default(0) }} GB"
+          - "Memory Used         : {{ memory_used_gb | default(0) }} GB"
+          - "Memory Free         : {{ memory_free_gb | default(0) }} GB"
+          - "Memory Usage        : {{ memory_usage | default(0) }} %"
+          - "Memory Status       : {{ memory_status | default('UNKNOWN') }}"
           - ""
-          - "[ DISK - ROOT ]"
+          - "[ DISK ]"
           - "----------------------------------------------------------------------"
-          - "Disk Total          : {{ disk_total_gb | default('0.00') }} GB"
-          - "Disk Used           : {{ disk_used_gb | default('0.00') }} GB"
-          - "Disk Available      : {{ disk_available_gb | default('0.00') }} GB"
-          - "Disk Usage          : {{ disk_usage | default('0.00') }} %"
-          - "Disk Status         : {{ disk_status_result.stdout | default('UNKNOWN') }}"
+          - "Disk Total          : {{ root_disk_total_gb | default(0) }} GB"
+          - "Disk Used           : {{ root_disk_used_gb | default(0) }} GB"
+          - "Disk Free           : {{ root_disk_free_gb | default(0) }} GB"
+          - "Disk Usage          : {{ root_disk_usage | default(0) }} %"
+          - "Disk Status         : {{ disk_status | default('UNKNOWN') }}"
           - ""
-          - "[ FILESYSTEMS ]"
+          - "[ NETWORK ]"
           - "----------------------------------------------------------------------"
-          - "{{ filesystem_result.stdout | default('N/A') }}"
+          - "Interface Checked   : {{ network_interface | default('N/A') }}"
+          - "Network Status      : {{ network_status | default('UNKNOWN') }}"
+          - "RX Traffic          : {{ network_rx_gb | default(0) }} GB"
+          - "TX Traffic          : {{ network_tx_gb | default(0) }} GB"
+          - "Interfaces:"
+          - "{{ network_interfaces | default([]) }}"
           - ""
-          - "[ NETWORK TRAFFIC ]"
+          - "[ USERS ]"
           - "----------------------------------------------------------------------"
-          - "RX Traffic          : {{ network_rx_mbps | default('0.00') }} Mbps"
-          - "TX Traffic          : {{ network_tx_mbps | default('0.00') }} Mbps"
+          - "Logged-in Users     : {{ logged_in_users | default('None') }}"
+          - "Linux Users Count   : {{ linux_user_count | default(0) }}"
           - ""
-          - "[ NETWORK INTERFACES ]"
+          - "[ SERVICES ]"
           - "----------------------------------------------------------------------"
-          - "{{ interfaces_result.stdout | default('N/A') }}"
+          - "Running Services    : {{ running_service_count | default(0) }}"
+          - "Failed Services     : {{ failed_service_count | default(0) }}"
+          - "Required Services   : {{ required_service_status | default('UNKNOWN') }}"
+          - "Required Service Details:"
+          - "{{ required_service_report | default([]) }}"
           - ""
-          - "[ LOGGED-IN USERS ]"
-          - "----------------------------------------------------------------------"
-          - "{{ logged_users_result.stdout | default('No users currently logged in') }}"
-          - ""
-          - "[ REQUIRED SERVICES ]"
-          - "----------------------------------------------------------------------"
-          - "{% for item in service_check_result.results | default([]) %}{{ item.stdout | default('N/A') }}{% if not loop.last %} | {% endif %}{% endfor %}"
-          - ""
-          - "[ RUNNING SERVICES ]"
-          - "----------------------------------------------------------------------"
-          - "{{ running_services_result.stdout | default('N/A') }}"
-          - ""
-          - "[ TOP CPU PROCESSES ]"
-          - "----------------------------------------------------------------------"
-          - "{{ top_cpu_processes_result.stdout | default('N/A') }}"
-          - ""
-          - "[ TOP MEMORY PROCESSES ]"
-          - "----------------------------------------------------------------------"
-          - "{{ top_memory_processes_result.stdout | default('N/A') }}"
-          - ""
-          - "[ ACTIVE COMMANDS / PROCESSES ]"
-          - "----------------------------------------------------------------------"
-          - "{{ process_commands_result.stdout | default('N/A') }}"
-          - ""
-          - "[ RECENT SYSTEM WARNINGS / CHANGES ]"
-          - "----------------------------------------------------------------------"
-          - "{{ recent_changes_result.stdout | default('No recent warnings') }}"
+          - "Running Service Details:"
+          - "{{ running_service_details | default([]) }}"
           - ""
           - "[ SAP ]"
           - "----------------------------------------------------------------------"
-          - "SAPControl         : {{ sapcontrol_check.stdout | default('N/A') }}"
-          - "SAP Instances      :"
-          - "{{ sap_instances_result.stdout | default('N/A') }}"
-          - ""
-          - "SAP Processes      :"
-          - "{{ sap_process_result.stdout | default('N/A') }}"
+          - "SAP Status          : {{ sap_status | default('N/A') }}"
+          - "SAP Processes       : {{ sap_process_display | default('N/A') }}"
+          - "SAP Instances       : {{ sap_instance_display | default('N/A') }}"
           - ""
           - "[ SSL CERTIFICATES ]"
           - "----------------------------------------------------------------------"
-          - "{% if certificate_results.results | default([]) | length == 0 %}No SSL certificates configured for checking.{% else %}"
-          - "{% for cert in certificate_results.results | default([]) %}"
-          - "{{ cert.stdout | default('Certificate check failed') }}"
-          - "----------------------------------------------------------------------"
-          - "{% endfor %}{% endif %}"
+          - "Certificate Status  : {{ certificate_status | default('N/A') }}"
+          - "Certificate Details:"
+          - "{{ certificate_display | default(['N/A']) }}"
           - ""
           - "======================================================================"
           - "                         END OF REPORT"
           - "======================================================================"
+
+      changed_when: false

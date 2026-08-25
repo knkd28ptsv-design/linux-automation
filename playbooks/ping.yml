@@ -7,7 +7,7 @@
   vars:
 
     # ============================================================
-    # HEALTH THRESHOLDS
+    # THRESHOLDS
     # ============================================================
 
     cpu_warning: 70
@@ -24,37 +24,36 @@
 
     ssh_port: 22
 
-    # Services you want to monitor.
-    # Remove/add services as required.
+    # Services to monitor
+    # Add/remove services according to your environment.
     monitored_services:
       - ssh
       - docker
       - containerd
       - nginx
 
-    # SAP ports/certificates can be customized here.
+    # SSL certificates to check
     certificate_checks:
       - name: "Local HTTPS"
         host: "{{ ansible_host | default(inventory_hostname) }}"
         port: 443
 
 
-  # ================================================================
-  # INITIALIZATION
-  # ================================================================
-
   tasks:
+
+    # ============================================================
+    # INITIALIZE VARIABLES
+    # ============================================================
 
     - name: Initialize health variables
       ansible.builtin.set_fact:
-
-        cpu_usage: 0 | float
+        cpu_usage: 0.0
         cpu_status: "UNKNOWN"
 
-        memory_total_mb: 0 | float
-        memory_used_mb: 0 | float
-        memory_free_mb: 0 | float
-        memory_usage: 0 | float
+        memory_total_mb: 0.0
+        memory_used_mb: 0.0
+        memory_free_mb: 0.0
+        memory_usage: 0.0
         memory_status: "UNKNOWN"
 
         disk_status: "PASS"
@@ -62,8 +61,8 @@
 
         network_status: "PASS"
         network_interfaces: []
-        network_rx_mb: 0 | float
-        network_tx_mb: 0 | float
+        network_rx_mb: 0.0
+        network_tx_mb: 0.0
 
         ssh_status: "FAIL"
         ssh_service_status: "UNKNOWN"
@@ -73,7 +72,6 @@
 
         sap_status: "NOT DETECTED"
         sap_processes: []
-        sap_instances: []
 
         certificate_status: "PASS"
         certificate_report: []
@@ -81,9 +79,9 @@
         health_reasons: []
 
 
-    # ================================================================
-    # BASIC SERVER INFORMATION
-    # ================================================================
+    # ============================================================
+    # CONNECTIVITY
+    # ============================================================
 
     - name: Test Ansible connectivity
       ansible.builtin.ping:
@@ -120,49 +118,54 @@
         ssh_status: >-
           {{
             'PASS'
-            if ssh_port_result.failed is false
+            if not ssh_port_result.failed | default(true)
             else 'FAIL'
           }}
 
         ssh_service_status: >-
           {{
             'RUNNING'
-            if ssh_service_result.stdout | default('') | trim == 'active'
+            if (ssh_service_result.stdout | default('') | trim) == 'active'
             else 'NOT RUNNING'
           }}
 
 
-    # ================================================================
+    # ============================================================
     # UPTIME
-    # ================================================================
+    # ============================================================
 
-    - name: Get uptime seconds
-      ansible.builtin.command:
-        cmd: awk '{print int($1)}' /proc/uptime
-      register: uptime_seconds_result
+    # IMPORTANT:
+    # Do not store uptime as AnsibleUnsafeText and then use //
+    # directly against it.
+    # Calculate the display value in shell instead.
+
+    - name: Get formatted uptime
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        uptime_seconds=$(awk '{print int($1)}' /proc/uptime)
+
+        days=$(( uptime_seconds / 86400 ))
+        hours=$(( (uptime_seconds % 86400) / 3600 ))
+        minutes=$(( (uptime_seconds % 3600) / 60 ))
+
+        echo "${days} days ${hours} hours ${minutes} minutes"
+      args:
+        executable: /bin/bash
+      register: uptime_result
       changed_when: false
       failed_when: false
       no_log: true
 
 
-    - name: Calculate uptime
+    - name: Set uptime display
       ansible.builtin.set_fact:
-        uptime_seconds: "{{ uptime_seconds_result.stdout | default('0') | int }}"
+        uptime_display: "{{ uptime_result.stdout | default('N/A') | trim }}"
 
 
-    - name: Format uptime
-      ansible.builtin.set_fact:
-        uptime_display: >-
-          {{
-            ((uptime_seconds // 86400) | int) ~ ' days ' ~
-            (((uptime_seconds % 86400) // 3600) | int) ~ ' hours ' ~
-            (((uptime_seconds % 3600) // 60) | int) ~ ' minutes'
-          }}
-
-
-    # ================================================================
+    # ============================================================
     # CPU
-    # ================================================================
+    # ============================================================
 
     - name: Get CPU count
       ansible.builtin.command:
@@ -176,7 +179,10 @@
     - name: Collect CPU usage
       ansible.builtin.shell: |
         set -o pipefail
-        top -bn2 | grep "Cpu(s)" | tail -1 | \
+
+        top -bn2 |
+        grep "Cpu(s)" |
+        tail -1 |
         awk '{print 100 - $8}'
       args:
         executable: /bin/bash
@@ -195,7 +201,7 @@
       no_log: true
 
 
-    - name: Set CPU usage
+    - name: Set CPU statistics
       ansible.builtin.set_fact:
         cpu_count: "{{ cpu_count_result.stdout | default('0') | int }}"
         cpu_usage: "{{ cpu_usage_result.stdout | default('0') | trim | float }}"
@@ -216,18 +222,32 @@
           }}
 
 
-    # ================================================================
+    # ============================================================
     # MEMORY
-    # ================================================================
+    # ============================================================
 
     - name: Collect memory information
       ansible.builtin.shell: |
         set -o pipefail
-        free -m | awk '/^Mem:/ {
+
+        free -m |
+        awk '/^Mem:/ {
           total=$2;
           available=$7;
           used=total-available;
-          printf "%.0f %.0f %.0f %.2f\n", total, used, available, (used/total)*100
+
+          if (total > 0) {
+            usage=(used/total)*100
+          }
+          else {
+            usage=0
+          }
+
+          printf "%.0f %.0f %.0f %.2f\n",
+                 total,
+                 used,
+                 available,
+                 usage
         }'
       args:
         executable: /bin/bash
@@ -239,7 +259,13 @@
 
     - name: Set memory values
       ansible.builtin.set_fact:
-        memory_values: "{{ memory_result.stdout | default('0 0 0 0') | trim | split(' ') }}"
+        memory_values: >-
+          {{
+            memory_result.stdout |
+            default('0 0 0 0') |
+            trim |
+            split()
+          }}
 
 
     - name: Set memory statistics
@@ -264,16 +290,17 @@
           }}
 
 
-    # ================================================================
+    # ============================================================
     # DISK
-    # ================================================================
+    # ============================================================
 
     - name: Collect disk usage
       ansible.builtin.shell: |
-        df -Pk -x tmpfs -x devtmpfs | \
+        df -Pk -x tmpfs -x devtmpfs |
         awk 'NR>1 {
           gsub("%","",$5);
-          printf "%s|%s|%s|%s|%s\n",$6,$2,$3,$4,$5
+          printf "%s|%s|%s|%s|%s\n",
+                 $6,$2,$3,$4,$5
         }'
       register: disk_result
       changed_when: false
@@ -328,26 +355,15 @@
           }}
 
 
-    # ================================================================
-    # NETWORK INTERFACES
-    # ================================================================
+    # ============================================================
+    # NETWORK
+    # ============================================================
 
     - name: Get network interfaces
       ansible.builtin.shell: |
-        ip -o -4 addr show | \
+        ip -o -4 addr show |
         awk '{print $2 "|" $4}'
       register: network_interfaces_result
-      changed_when: false
-      failed_when: false
-      no_log: true
-
-
-    - name: Get network interface states
-      ansible.builtin.shell: |
-        ip -o link show | \
-        awk -F': ' '{print $2}' | \
-        cut -d' ' -f1
-      register: interface_names_result
       changed_when: false
       failed_when: false
       no_log: true
@@ -360,15 +376,20 @@
           rx=0;
           tx=0
         }
+
         /:/ {
           gsub(":","",$1)
+
           if ($1 != "lo") {
             rx += $2
             tx += $10
           }
         }
+
         END {
-          printf "%.2f %.2f\n",rx/1024/1024,tx/1024/1024
+          printf "%.2f %.2f\n",
+                 rx/1024/1024,
+                 tx/1024/1024
         }' /proc/net/dev
       register: network_traffic_result
       changed_when: false
@@ -376,18 +397,18 @@
       no_log: true
 
 
-    - name: Set network traffic
+    - name: Set network traffic values
       ansible.builtin.set_fact:
         network_traffic_values: >-
           {{
             network_traffic_result.stdout |
             default('0 0') |
             trim |
-            split(' ')
+            split()
           }}
 
 
-    - name: Set network traffic values
+    - name: Set network statistics
       ansible.builtin.set_fact:
         network_rx_mb: "{{ network_traffic_values[0] | default('0') | float }}"
         network_tx_mb: "{{ network_traffic_values[1] | default('0') | float }}"
@@ -408,27 +429,28 @@
         - item | length > 0
 
 
-    # ================================================================
+    # ============================================================
     # LOGGED-IN USERS
-    # ================================================================
+    # ============================================================
 
     - name: Get logged-in users
       ansible.builtin.shell: |
-        who | awk '{print $1 "|" $2 "|" $5}' || true
+        who |
+        awk '{print $1 "|" $2 "|" $5}' || true
       register: logged_users_result
       changed_when: false
       failed_when: false
       no_log: true
 
 
-    - name: Build logged-in user report
+    - name: Set logged-in users
       ansible.builtin.set_fact:
         logged_users: "{{ logged_users_result.stdout_lines | default([]) }}"
 
 
-    # ================================================================
+    # ============================================================
     # SERVICES
-    # ================================================================
+    # ============================================================
 
     - name: Check monitored services
       ansible.builtin.command:
@@ -472,16 +494,15 @@
               list |
               length > 0
             )
-            else
-            'PASS'
+            else 'PASS'
           }}
 
 
-    # ================================================================
-    # SAP CHECK
-    # ================================================================
+    # ============================================================
+    # SAP
+    # ============================================================
 
-    - name: Check SAPCONTROL command
+    - name: Check SAPCONTROL
       ansible.builtin.shell: |
         command -v sapcontrol || true
       register: sapcontrol_result
@@ -492,8 +513,9 @@
 
     - name: Detect SAP processes
       ansible.builtin.shell: |
-        ps -eo user,pid,cmd | \
-        grep -E '[s]apstartsrv|[h]dbnameserver|[h]dbindexserver|[h]dbdaemon' || true
+        ps -eo user,pid,cmd |
+        grep -E '[s]apstartsrv|[h]dbnameserver|[h]dbindexserver|[h]dbdaemon' ||
+        true
       register: sap_process_result
       changed_when: false
       failed_when: false
@@ -510,14 +532,14 @@
         sap_status: >-
           {{
             'RUNNING'
-            if (sap_processes | length > 0)
+            if (sap_processes | length) > 0
             else 'NOT DETECTED'
           }}
 
 
-    # ================================================================
-    # SSL CERTIFICATE
-    # ================================================================
+    # ============================================================
+    # SSL CERTIFICATES
+    # ============================================================
 
     - name: Check SSL certificates
       ansible.builtin.shell: |
@@ -588,16 +610,21 @@
             certificate_report +
             [{
               'name': item.item.name,
-              'expiry': (
-                item.stdout.split('|')[0]
-                if '|' in item.stdout
-                else 'ERROR'
-              ),
-              'days': (
-                item.stdout.split('|')[1] | int
-                if '|' in item.stdout
-                else 0
-              ),
+
+              'expiry':
+                (
+                  item.stdout.split('|')[0]
+                  if '|' in item.stdout
+                  else 'ERROR'
+                ),
+
+              'days':
+                (
+                  item.stdout.split('|')[1] | int
+                  if '|' in item.stdout
+                  else 0
+                ),
+
               'status':
                 (
                   'FAIL'
@@ -643,16 +670,18 @@
           }}
 
 
-    # ================================================================
+    # ============================================================
     # OVERALL HEALTH
-    # ================================================================
+    # ============================================================
 
     - name: Build health reasons
       ansible.builtin.set_fact:
         health_reasons: >-
           {{
             health_reasons
+
             +
+
             (
               ['CPU usage is critical']
               if cpu_status == 'FAIL'
@@ -661,7 +690,9 @@
               if cpu_status == 'WARNING'
               else []
             )
+
             +
+
             (
               ['Memory usage is critical']
               if memory_status == 'FAIL'
@@ -670,7 +701,9 @@
               if memory_status == 'WARNING'
               else []
             )
+
             +
+
             (
               ['Disk usage is critical']
               if disk_status == 'FAIL'
@@ -679,19 +712,25 @@
               if disk_status == 'WARNING'
               else []
             )
+
             +
+
             (
               ['SSH port 22 is unavailable']
               if ssh_status == 'FAIL'
               else []
             )
+
             +
+
             (
               ['One or more monitored services are not running']
               if service_status == 'WARNING'
               else []
             )
+
             +
+
             (
               ['SSL certificate is critically close to expiry']
               if certificate_status == 'FAIL'
@@ -729,9 +768,9 @@
           }}
 
 
-    # ================================================================
-    # CLEAN FINAL REPORT
-    # ================================================================
+    # ============================================================
+    # CLEAN AWX REPORT
+    # ============================================================
 
     - name: Display clean Linux health report
       ansible.builtin.debug:
@@ -781,7 +820,17 @@
           - "======================================================================"
           - ""
           - "Filesystem          Total       Used       Free       Usage     Status"
-          - "{% for d in disk_report %}{{ '%-19s' | format(d.filesystem) }}{{ '%-12s' | format('%.2f GB' | format((d.total_kb | float) / 1024 / 1024)) }}{{ '%-11s' | format('%.2f GB' | format((d.used_kb | float) / 1024 / 1024)) }}{{ '%-11s' | format('%.2f GB' | format((d.free_kb | float) / 1024 / 1024)) }}{{ '%-10s' | format((d.usage | float) ~ '%') }}{{ 'FAIL' if (d.usage | float) >= (disk_critical | float) else 'WARNING' if (d.usage | float) >= (disk_warning | float) else 'PASS' }}{% endfor %}"
+
+          - >-
+            {% for d in disk_report %}
+            {{ '%-19s' | format(d.filesystem) }}
+            {{ '%-12s' | format('%.2f GB' | format((d.total_kb | float) / 1024 / 1024)) }}
+            {{ '%-11s' | format('%.2f GB' | format((d.used_kb | float) / 1024 / 1024)) }}
+            {{ '%-11s' | format('%.2f GB' | format((d.free_kb | float) / 1024 / 1024)) }}
+            {{ '%-10s' | format((d.usage | float) ~ '%') }}
+            {{ 'FAIL' if (d.usage | float) >= (disk_critical | float) else 'WARNING' if (d.usage | float) >= (disk_warning | float) else 'PASS' }}
+            {% endfor %}
+
           - ""
           - "Disk Status         : {{ disk_status }}"
           - ""
@@ -790,31 +839,46 @@
           - "======================================================================"
           - ""
           - "Interface           IP Address"
-          - "{% for n in network_interfaces %}{{ '%-19s' | format(n.interface) }}{{ n.address }}{% endfor %}"
+
+          - >-
+            {% for n in network_interfaces %}
+            {{ '%-19s' | format(n.interface) }}{{ n.address }}
+            {% endfor %}
+
           - ""
-          - "RX Traffic          : {{ '%.2f' | format(network_rx_mb | float / 1024) }} GB"
-          - "TX Traffic          : {{ '%.2f' | format(network_tx_mb | float / 1024) }} GB"
+          - "RX Traffic          : {{ '%.2f' | format((network_rx_mb | float) / 1024) }} GB"
+          - "TX Traffic          : {{ '%.2f' | format((network_tx_mb | float) / 1024) }} GB"
           - "Network Status      : {{ network_status }}"
           - ""
           - "======================================================================"
           - "[ LOGGED-IN USERS ]"
           - "======================================================================"
           - ""
-          - "{% if logged_users | length > 0 %}"
-          - "User                Terminal             From"
-          - "{% for u in logged_users %}{{ u }}{% endfor %}"
-          - "Total Logged Users  : {{ logged_users | length }}"
-          - "{% else %}"
-          - "No interactive users currently logged in."
-          - "Total Logged Users  : 0"
-          - "{% endif %}"
+
+          - >-
+            {% if logged_users | length > 0 %}
+            Logged-in Users:
+            {% for u in logged_users %}
+            {{ u }}
+            {% endfor %}
+            Total Logged Users  : {{ logged_users | length }}
+            {% else %}
+            No interactive users currently logged in.
+            Total Logged Users  : 0
+            {% endif %}
+
           - ""
           - "======================================================================"
           - "[ SERVICES ]"
           - "======================================================================"
           - ""
           - "Service             Status"
-          - "{% for s in service_report %}{{ '%-20s' | format(s.name) }}{{ s.status }}{% endfor %}"
+
+          - >-
+            {% for s in service_report %}
+            {{ '%-20s' | format(s.name) }}{{ s.status }}
+            {% endfor %}
+
           - ""
           - "Service Status      : {{ service_status }}"
           - ""
@@ -823,19 +887,32 @@
           - "======================================================================"
           - ""
           - "SAP Status          : {{ sap_status }}"
-          - "{% if sap_processes | length > 0 %}"
-          - "SAP Processes:"
-          - "{% for p in sap_processes %}{{ p }}{% endfor %}"
-          - "{% else %}"
-          - "SAP Processes       : N/A"
-          - "{% endif %}"
+
+          - >-
+            {% if sap_processes | length > 0 %}
+            SAP Processes:
+            {% for p in sap_processes %}
+            {{ p }}
+            {% endfor %}
+            {% else %}
+            SAP Processes       : N/A
+            {% endif %}
+
           - ""
           - "======================================================================"
           - "[ SSL CERTIFICATES ]"
           - "======================================================================"
           - ""
           - "Certificate         Expiry Date              Days Left    Status"
-          - "{% for c in certificate_report %}{{ '%-20s' | format(c.name) }}{{ '%-26s' | format(c.expiry) }}{{ '%-13s' | format(c.days) }}{{ c.status }}{% endfor %}"
+
+          - >-
+            {% for c in certificate_report %}
+            {{ '%-20s' | format(c.name) }}
+            {{ '%-26s' | format(c.expiry) }}
+            {{ '%-13s' | format(c.days) }}
+            {{ c.status }}
+            {% endfor %}
+
           - ""
           - "Certificate Status  : {{ certificate_status }}"
           - ""
@@ -845,13 +922,18 @@
           - ""
           - "Overall Health      : {{ overall_health }}"
           - ""
-          - "{% if health_reasons | length > 0 %}"
-          - "HEALTH REASONS:"
-          - "{% for reason in health_reasons %}- {{ reason }}{% endfor %}"
-          - "{% else %}"
-          - "HEALTH REASONS:"
-          - "- No issues detected"
-          - "{% endif %}"
+
+          - >-
+            {% if health_reasons | length > 0 %}
+            HEALTH REASONS:
+            {% for reason in health_reasons %}
+            - {{ reason }}
+            {% endfor %}
+            {% else %}
+            HEALTH REASONS:
+            - No issues detected
+            {% endif %}
+
           - ""
           - "======================================================================"
           - "                    END OF HEALTH CHECK"

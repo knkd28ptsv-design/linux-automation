@@ -18,13 +18,6 @@
     disk_warning: 80
     disk_critical: 90
 
-    # Certificate thresholds
-    certificate_warning_days: 30
-    certificate_critical_days: 7
-
-    # false = an unavailable certificate endpoint is reported as N/A
-    # true  = an unavailable certificate endpoint causes FAIL
-    certificate_required: false
 
     # Add services that MUST be running.
     # Example:
@@ -34,11 +27,6 @@
     #   - chronyd
     health_check_services: []
 
-    # HTTPS certificate endpoints to check from the AWX execution node.
-    # Set certificate_checks: [] if a server has no HTTPS service.
-    certificate_checks:
-      - name: Local HTTPS
-        port: 443
 
   tasks:
 
@@ -497,139 +485,6 @@
       when: sap_detected | default(false)
 
     # ================================================================
-    # SSL CERTIFICATES
-    # ================================================================
-
-    # IMPORTANT:
-    # This runs on the AWX execution node and does NOT use sudo.
-    # Therefore it avoids the previous "sudo: command not found" error.
-    - name: Check SSL certificates from AWX execution node
-      ansible.builtin.shell: |
-        set -o pipefail
-
-        target="{{ item.host | default(ansible_host | default(inventory_hostname)) }}"
-        port="{{ item.port | default(443) }}"
-
-        expiry=$(
-          echo |
-          openssl s_client \
-            -connect "${target}:${port}" \
-            -servername "${target}" \
-            2>/dev/null |
-          openssl x509 -noout -enddate 2>/dev/null |
-          cut -d= -f2
-        )
-
-        if [ -z "${expiry}" ]; then
-          printf 'ERROR|0\n'
-        else
-          expiry_epoch=$(date -d "${expiry}" +%s 2>/dev/null || true)
-          now_epoch=$(date +%s)
-
-          if [ -z "${expiry_epoch}" ]; then
-            printf '%s|0\n' "${expiry}"
-          else
-            days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
-            printf '%s|%s\n' "${expiry}" "${days_left}"
-          fi
-        fi
-      args:
-        executable: /bin/bash
-      loop: "{{ certificate_checks | default([]) }}"
-      loop_control:
-        label: "{{ item.name | default('HTTPS') }}:{{ item.port | default(443) }}"
-      delegate_to: localhost
-      become: false
-      register: certificate_results
-      changed_when: false
-      failed_when: false
-
-    - name: Initialize certificate report
-      ansible.builtin.set_fact:
-        certificate_report: []
-        certificate_status: "N/A"
-
-    - name: Build certificate report
-      ansible.builtin.set_fact:
-        certificate_report: >-
-          {{
-            certificate_report + [{
-              'name': item.item.name | default('Certificate'),
-              'host': item.item.host | default(ansible_host | default(inventory_hostname)),
-              'port': item.item.port | default(443),
-              'expiry': (
-                item.stdout.split('|')[0]
-                if (item.stdout | default('') | trim | length > 0)
-                else 'ERROR'
-              ),
-              'days_left': (
-                item.stdout.split('|')[1] | int
-                if (
-                  (item.stdout | default('') | trim | length > 0)
-                  and (item.stdout.split('|') | length > 1)
-                )
-                else -1
-              ),
-              'status': (
-                'FAIL'
-                if (
-                  (item.stdout | default('ERROR') | trim == 'ERROR')
-                  and (certificate_required | bool)
-                )
-                else 'N/A'
-                if (item.stdout | default('ERROR') | trim == 'ERROR')
-                else 'FAIL'
-                if (
-                  (item.stdout.split('|') | length > 1)
-                  and (item.stdout.split('|')[1] | int) < (certificate_critical_days | int)
-                )
-                else 'WARNING'
-                if (
-                  (item.stdout.split('|') | length > 1)
-                  and (item.stdout.split('|')[1] | int) < (certificate_warning_days | int)
-                )
-                else 'PASS'
-              )
-            }]
-          }}
-      loop: "{{ certificate_results.results | default([]) }}"
-      when: item.item is defined
-
-    - name: Determine certificate status
-      ansible.builtin.set_fact:
-        certificate_status: >-
-          {{
-            'FAIL'
-            if (
-              certificate_report
-              | selectattr('status', 'equalto', 'FAIL')
-              | list
-              | length > 0
-            )
-            else 'WARNING'
-            if (
-              certificate_report
-              | selectattr('status', 'equalto', 'WARNING')
-              | list
-              | length > 0
-            )
-            else 'N/A'
-            if (
-              certificate_report | length == 0
-              or
-              (
-                certificate_report
-                | selectattr('status', 'equalto', 'N/A')
-                | list
-                | length
-                ==
-                certificate_report | length
-              )
-            )
-            else 'PASS'
-          }}
-
-    # ================================================================
     # FINAL HEALTH CALCULATION
     # ================================================================
 
@@ -656,14 +511,12 @@
               or disk_status == 'FAIL'
               or ssh_status == 'FAIL'
               or service_status == 'FAIL'
-              or certificate_status == 'FAIL'
             )
             else 'WARNING'
             if (
               cpu_status == 'WARNING'
               or memory_status == 'WARNING'
               or disk_status == 'WARNING'
-              or certificate_status == 'WARNING'
             )
             else 'PASS'
           }}
@@ -676,7 +529,6 @@
             + (['Disk usage is critical'] if disk_status == 'FAIL' else [])
             + (['SSH service or port is unavailable'] if ssh_status == 'FAIL' else [])
             + (['Configured service is not active'] if service_status == 'FAIL' else [])
-            + (['SSL certificate is expired/unavailable/critical'] if certificate_status == 'FAIL' else [])
           }}
 
     # ================================================================
@@ -770,12 +622,6 @@
           - "SAP Processes:"
           - "{{ sap_processes_raw.stdout | default('No SAP processes detected') }}"
           - ""
-          - "[ SSL CERTIFICATES ]"
-          - "----------------------------------------------------------------------"
-          - "Certificate Status  : {{ certificate_status }}"
-          - "Certificate Details:"
-          - "{{ certificate_report | default([]) }}"
-          - ""
           - "[ HEALTH SUMMARY ]"
           - "----------------------------------------------------------------------"
           - "Overall Health      : {{ overall_health }}"
@@ -812,17 +658,3 @@
       ansible.builtin.debug:
         msg: "{{ sap_instances_raw.stdout | default('No SAP instance information available') }}"
       when: sap_detected | default(false)
-
-    - name: Display certificate report
-      ansible.builtin.debug:
-        msg: >-
-          {{ item.name | default('Certificate') }}
-          | Host: {{ item.host | default('N/A') }}
-          | Port: {{ item.port | default(443) }}
-          | Expiry: {{ item.expiry | default('ERROR') }}
-          | Days Left: {{ item.days_left | default('N/A') }}
-          | Status: {{ item.status | default('UNKNOWN') }}
-      loop: "{{ certificate_report | default([]) }}"
-      loop_control:
-        label: "{{ item.name | default('Certificate') }}"
-      when: certificate_report | default([]) | length > 0

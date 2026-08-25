@@ -10,14 +10,14 @@
     # GENERAL THRESHOLDS
     # ============================================================
 
-    cpu_warning: 80
-    cpu_critical: 90
+    cpu_warning: 80.0
+    cpu_critical: 90.0
 
-    memory_warning: 80
-    memory_critical: 90
+    memory_warning: 80.0
+    memory_critical: 90.0
 
-    disk_warning: 80
-    disk_critical: 90
+    disk_warning: 80.0
+    disk_critical: 90.0
 
     certificate_warning_days: 30
     certificate_critical_days: 15
@@ -26,31 +26,28 @@
     # ============================================================
     # LINUX SERVICES
     # ============================================================
+    # Add services which must be running.
     #
-    # Add services that MUST be running on the server.
-    #
-    # Your current server has SSH.
-    #
-    required_services:
-      - ssh
-
     # Example:
-    #
     # required_services:
     #   - ssh
     #   - nginx
+    #
+    # For your current Ubuntu server:
+    #
+
+    required_services:
+      - ssh
 
 
     # ============================================================
     # SAP CONFIGURATION
     # ============================================================
     #
-    # Change these values for your SAP server.
+    # Change these values for SAP servers.
     #
-    # Example:
-    #
-    # SID        = PRD
-    # Instance   = 00
+    # For a non-SAP server:
+    # sap_enabled: false
     #
 
     sap_enabled: true
@@ -71,13 +68,10 @@
 
 
     # ============================================================
-    # CERTIFICATE CONFIGURATION
+    # SSL CERTIFICATE CONFIGURATION
     # ============================================================
     #
-    # Add all HTTPS certificates that need monitoring.
-    #
-    # IMPORTANT:
-    # Replace these example values with your actual DNS names.
+    # Change these to your actual certificate endpoints.
     #
 
     certificate_enabled: true
@@ -88,22 +82,15 @@
         host: "10.15.4.90"
         port: 443
 
-    #
-    # Example for multiple certificates:
-    #
-    # certificate_endpoints:
-    #
-    #   - name: "SAP HTTPS"
-    #     host: "sap.example.com"
-    #     port: 443
-    #
-    #   - name: "SAP Web Dispatcher"
-    #     host: "sapweb.example.com"
-    #     port: 443
-    #
-    #   - name: "SAP Fiori"
-    #     host: "fiori.example.com"
-    #     port: 443
+      # Example:
+      #
+      # - name: "SAP Web Dispatcher"
+      #   host: "sapweb.example.com"
+      #   port: 443
+      #
+      # - name: "SAP Fiori"
+      #   host: "fiori.example.com"
+      #   port: 443
 
 
   tasks:
@@ -174,7 +161,7 @@
 
     - name: Set CPU usage
       ansible.builtin.set_fact:
-        cpu_usage: "{{ cpu_usage_result.stdout | float }}"
+        cpu_usage: "{{ cpu_usage_result.stdout | trim | float }}"
 
 
     # ============================================================
@@ -201,10 +188,10 @@
         cpu_status: >-
           {{
             'FAIL'
-            if cpu_usage >= cpu_critical
+            if (cpu_usage | float) >= (cpu_critical | float)
             else
             'WARNING'
-            if cpu_usage >= cpu_warning
+            if (cpu_usage | float) >= (cpu_warning | float)
             else
             'PASS'
           }}
@@ -227,8 +214,9 @@
           >-
           {{
             (
-              ansible_memtotal_mb -
-              ansible_memory_mb.real.free
+              ansible_memtotal_mb | int
+              -
+              ansible_memory_mb.real.free | int
             ) | int
           }}
 
@@ -237,14 +225,16 @@
           {{
             (
               (
-                ansible_memtotal_mb -
-                ansible_memory_mb.real.free
+                (
+                  ansible_memtotal_mb | float
+                  -
+                  ansible_memory_mb.real.free | float
+                )
+                /
+                (ansible_memtotal_mb | float)
               )
-              /
-              ansible_memtotal_mb
-              *
-              100
-            ) | round(2)
+              * 100
+            ) | float | round(2)
           }}
 
 
@@ -258,10 +248,10 @@
         memory_status: >-
           {{
             'FAIL'
-            if memory_used_percent >= memory_critical
+            if (memory_used_percent | float) >= (memory_critical | float)
             else
             'WARNING'
-            if memory_used_percent >= memory_warning
+            if (memory_used_percent | float) >= (memory_warning | float)
             else
             'PASS'
           }}
@@ -277,13 +267,17 @@
           gsub("%","",$5);
           print $5
         }'
+
       register: disk_usage_result
+
       changed_when: false
 
 
     - name: Set root disk usage
       ansible.builtin.set_fact:
-        disk_usage: "{{ disk_usage_result.stdout | int }}"
+
+        disk_usage:
+          "{{ disk_usage_result.stdout | trim | float }}"
 
 
     # ============================================================
@@ -296,10 +290,10 @@
         disk_status: >-
           {{
             'FAIL'
-            if disk_usage >= disk_critical
+            if (disk_usage | float) >= (disk_critical | float)
             else
             'WARNING'
-            if disk_usage >= disk_warning
+            if (disk_usage | float) >= (disk_warning | float)
             else
             'PASS'
           }}
@@ -312,7 +306,9 @@
     - name: Get filesystem usage
       ansible.builtin.shell: |
         df -P -x tmpfs -x devtmpfs -x overlay
+
       register: filesystem_result
+
       changed_when: false
 
 
@@ -323,7 +319,9 @@
     - name: Get network interfaces
       ansible.builtin.command:
         cmd: ip -br addr
+
       register: network_result
+
       changed_when: false
 
 
@@ -334,8 +332,11 @@
     - name: Get default route
       ansible.builtin.command:
         cmd: ip route show default
+
       register: default_route_result
+
       changed_when: false
+
       failed_when: false
 
 
@@ -353,7 +354,7 @@
             (
               ansible_default_ipv4.address is defined
               and
-              default_route_result.stdout | length > 0
+              default_route_result.stdout | trim | length > 0
             )
             else
             'FAIL'
@@ -363,25 +364,25 @@
     # ============================================================
     # 14. NETWORK TRAFFIC
     # ============================================================
-    #
-    # Reads RX/TX counters from /proc/net/dev.
-    #
 
     - name: Collect network traffic
       ansible.builtin.shell: |
         awk '
         NR > 2 {
           gsub(":", "", $1);
+
           if ($1 != "lo") {
             rx += $2;
             tx += $10;
           }
         }
+
         END {
           print rx, tx
         }' /proc/net/dev
 
       register: network_traffic_result
+
       changed_when: false
 
 
@@ -406,13 +407,13 @@
           "{{ ansible_uptime_seconds | int }}"
 
         uptime_days:
-          "{{ (ansible_uptime_seconds / 86400) | int }}"
+          "{{ ((ansible_uptime_seconds | int) / 86400) | int }}"
 
         uptime_hours:
-          "{{ ((ansible_uptime_seconds % 86400) / 3600) | int }}"
+          "{{ (((ansible_uptime_seconds | int) % 86400) / 3600) | int }}"
 
         uptime_minutes:
-          "{{ ((ansible_uptime_seconds % 3600) / 60) | int }}"
+          "{{ (((ansible_uptime_seconds | int) % 3600) / 60) | int }}"
 
 
     # ============================================================
@@ -425,8 +426,9 @@
         uptime_status: >-
           {{
             'PASS'
-            if uptime_seconds > 0
-            else 'FAIL'
+            if (uptime_seconds | int) > 0
+            else
+            'FAIL'
           }}
 
 
@@ -437,6 +439,7 @@
     - name: Get Linux users
       ansible.builtin.getent:
         database: passwd
+
       register: users_result
 
 
@@ -453,8 +456,9 @@
         users_status: >-
           {{
             'PASS'
-            if linux_user_count | int > 0
-            else 'FAIL'
+            if (linux_user_count | int) > 0
+            else
+            'FAIL'
           }}
 
 
@@ -465,9 +469,13 @@
     - name: Check required Linux services
       ansible.builtin.command:
         cmd: "systemctl is-active {{ item }}"
+
       loop: "{{ required_services }}"
+
       register: service_results
+
       changed_when: false
+
       failed_when: false
 
 
@@ -479,6 +487,7 @@
       ansible.builtin.set_fact:
 
         services_status: >-
+
           {{
             'PASS'
             if
@@ -493,7 +502,8 @@
               ==
               required_services | length
             )
-            else 'FAIL'
+            else
+            'FAIL'
           }}
 
 
@@ -504,7 +514,9 @@
     - name: Check SAPCONTROL executable
       ansible.builtin.stat:
         path: "/usr/sap/{{ sap_sid }}/SYS/exe/uc/linuxx86_64/sapcontrol"
+
       register: sapcontrol_file
+
       when: sap_enabled
 
 
@@ -518,9 +530,13 @@
           /usr/sap/{{ sap_sid }}/SYS/exe/uc/linuxx86_64/sapcontrol
           -nr {{ sap_instance_number }}
           -function GetProcessList
+
       register: sap_process_result
+
       changed_when: false
+
       failed_when: false
+
       when:
         - sap_enabled
         - sapcontrol_file.stat.exists
@@ -534,15 +550,17 @@
       ansible.builtin.set_fact:
 
         sap_status: >-
+
           {{
             'PASS'
             if
             (
-              sap_process_result.rc == 0
+              sap_process_result.rc | default(1) | int == 0
               and
-              'GREEN' in sap_process_result.stdout
+              'GREEN' in (sap_process_result.stdout | default(''))
             )
-            else 'FAIL'
+            else
+            'FAIL'
           }}
 
       when:
@@ -560,9 +578,13 @@
           /usr/sap/{{ sap_sid }}/SYS/exe/uc/linuxx86_64/sapcontrol
           -nr {{ sap_instance_number }}
           -function GetSystemInstanceList
+
       register: sap_system_result
+
       changed_when: false
+
       failed_when: false
+
       when:
         - sap_enabled
         - sapcontrol_file.stat.exists
@@ -576,15 +598,17 @@
       ansible.builtin.set_fact:
 
         sap_system_status: >-
+
           {{
             'PASS'
             if
             (
-              sap_system_result.rc == 0
+              sap_system_result.rc | default(1) | int == 0
               and
-              'GREEN' in sap_system_result.stdout
+              'GREEN' in (sap_system_result.stdout | default(''))
             )
-            else 'FAIL'
+            else
+            'FAIL'
           }}
 
       when:
@@ -600,13 +624,31 @@
       ansible.builtin.set_fact:
 
         sap_status: "N/A"
+
         sap_system_status: "N/A"
 
       when: not sap_enabled
 
 
     # ============================================================
-    # 26. SSL CERTIFICATE CHECK
+    # 26. SAP STATUS WHEN SAPCONTROL IS MISSING
+    # ============================================================
+
+    - name: Set SAP status when SAPCONTROL is missing
+      ansible.builtin.set_fact:
+
+        sap_status: "FAIL"
+
+        sap_system_status: "FAIL"
+
+      when:
+        - sap_enabled
+        - sapcontrol_file is defined
+        - not sapcontrol_file.stat.exists
+
+
+    # ============================================================
+    # 27. SSL CERTIFICATE CHECK
     # ============================================================
 
     - name: Check SSL certificate expiry
@@ -629,7 +671,7 @@
 
 
     # ============================================================
-    # 27. CALCULATE CERTIFICATE DAYS
+    # 28. CALCULATE CERTIFICATE DAYS
     # ============================================================
 
     - name: Calculate certificate expiry days
@@ -650,7 +692,12 @@
           exit 0
         fi
 
-        expiry_epoch=$(date -d "$expiry" +%s)
+        expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+
+        if [ -z "$expiry_epoch" ]; then
+          echo "ERROR"
+          exit 0
+        fi
 
         now_epoch=$(date +%s)
 
@@ -670,7 +717,7 @@
 
 
     # ============================================================
-    # 28. CERTIFICATE STATUS
+    # 29. CERTIFICATE STATUS
     # ============================================================
 
     - name: Determine certificate overall status
@@ -682,17 +729,21 @@
 
           {%- for cert in certificate_days_results.results -%}
 
-            {%- if cert.stdout | trim == 'ERROR' -%}
+            {%- set days = cert.stdout | trim -%}
+
+            {%- if days == 'ERROR' or days == '' -%}
 
               {%- set ns.status = 'FAIL' -%}
 
-            {%- elif cert.stdout | int <= certificate_critical_days -%}
+            {%- elif (days | int) <= (certificate_critical_days | int) -%}
 
               {%- set ns.status = 'FAIL' -%}
 
-            {%- elif cert.stdout | int <= certificate_warning_days and ns.status != 'FAIL' -%}
+            {%- elif (days | int) <= (certificate_warning_days | int) -%}
 
-              {%- set ns.status = 'WARNING' -%}
+              {%- if ns.status != 'FAIL' -%}
+                {%- set ns.status = 'WARNING' -%}
+              {%- endif -%}
 
             {%- endif -%}
 
@@ -704,7 +755,7 @@
 
 
     # ============================================================
-    # 29. CERTIFICATE DEFAULT STATUS
+    # 30. CERTIFICATE DEFAULT STATUS
     # ============================================================
 
     - name: Set certificate status when disabled
@@ -716,7 +767,7 @@
 
 
     # ============================================================
-    # 30. OVERALL HEALTH
+    # 31. OVERALL HEALTH
     # ============================================================
 
     - name: Determine overall health
@@ -726,6 +777,7 @@
 
           {{
             'FAIL'
+
             if
             (
               ping_result.failed
@@ -745,18 +797,21 @@
               users_status == 'FAIL'
               or
               services_status == 'FAIL'
+
               or
               (
                 sap_enabled
                 and
                 sap_status == 'FAIL'
               )
+
               or
               (
                 sap_enabled
                 and
                 sap_system_status == 'FAIL'
               )
+
               or
               (
                 certificate_enabled
@@ -776,6 +831,7 @@
               memory_status == 'WARNING'
               or
               disk_status == 'WARNING'
+
               or
               (
                 certificate_enabled
@@ -791,7 +847,7 @@
 
 
     # ============================================================
-    # 31. FINAL HEALTH REPORT
+    # 32. FINAL HEALTH REPORT
     # ============================================================
 
     - name: Display complete Linux health report
@@ -800,7 +856,7 @@
         msg:
 
           - "=============================================================="
-          - "                LINUX SERVER HEALTH CHECK"
+          - "              LINUX SERVER HEALTH CHECK"
           - "=============================================================="
 
           - "Host                 : {{ inventory_hostname }}"
@@ -821,33 +877,33 @@
 
           - "=============================================================="
 
-          - "CPU Usage            : {{ cpu_usage }} %"
+          - "CPU Usage            : {{ cpu_usage | float | round(2) }} %"
 
           - "CPU Status           : {{ cpu_status }}"
 
-          - "CPU Cores            : {{ ansible_processor_vcpus }}"
+          - "CPU Cores            : {{ ansible_processor_vcpus | int }}"
 
-          - "CPU Load 1m          : {{ load_1m }}"
+          - "CPU Load 1m          : {{ load_1m | float | round(2) }}"
 
-          - "CPU Load 5m          : {{ load_5m }}"
+          - "CPU Load 5m          : {{ load_5m | float | round(2) }}"
 
-          - "CPU Load 15m         : {{ load_15m }}"
+          - "CPU Load 15m         : {{ load_15m | float | round(2) }}"
 
           - "=============================================================="
 
-          - "Memory Total         : {{ memory_total_mb }} MB"
+          - "Memory Total         : {{ memory_total_mb | int }} MB"
 
-          - "Memory Used          : {{ memory_used_mb }} MB"
+          - "Memory Used          : {{ memory_used_mb | int }} MB"
 
-          - "Memory Available     : {{ memory_available_mb }} MB"
+          - "Memory Available     : {{ memory_available_mb | int }} MB"
 
-          - "Memory Usage         : {{ memory_used_percent }} %"
+          - "Memory Usage         : {{ memory_used_percent | float | round(2) }} %"
 
           - "Memory Status        : {{ memory_status }}"
 
           - "=============================================================="
 
-          - "Root Disk Usage      : {{ disk_usage }} %"
+          - "Root Disk Usage      : {{ disk_usage | float | round(2) }} %"
 
           - "Disk Status          : {{ disk_status }}"
 
@@ -857,19 +913,19 @@
 
           - "Default Gateway      : {{ ansible_default_ipv4.gateway | default('N/A') }}"
 
-          - "Network RX Bytes     : {{ network_rx_bytes }}"
+          - "Network RX Bytes     : {{ network_rx_bytes | int }}"
 
-          - "Network TX Bytes     : {{ network_tx_bytes }}"
+          - "Network TX Bytes     : {{ network_tx_bytes | int }}"
 
           - "=============================================================="
 
-          - "Uptime               : {{ uptime_days }} days, {{ uptime_hours }} hours, {{ uptime_minutes }} minutes"
+          - "Uptime               : {{ uptime_days | int }} days, {{ uptime_hours | int }} hours, {{ uptime_minutes | int }} minutes"
 
           - "Uptime Status        : {{ uptime_status }}"
 
           - "=============================================================="
 
-          - "Linux User Count     : {{ linux_user_count }}"
+          - "Linux User Count     : {{ linux_user_count | int }}"
 
           - "Users Status         : {{ users_status }}"
 
@@ -881,9 +937,9 @@
 
           - "=============================================================="
 
-          - "SAP SID              : {{ sap_sid }}"
+          - "SAP SID              : {{ sap_sid if sap_enabled else 'N/A' }}"
 
-          - "SAP Instance         : {{ sap_instance_number }}"
+          - "SAP Instance         : {{ sap_instance_number if sap_enabled else 'N/A' }}"
 
           - "SAP Process Status   : {{ sap_status }}"
 
@@ -893,9 +949,9 @@
 
           - "Certificate Status   : {{ certificate_status }}"
 
-          - "Certificate Warning  : {{ certificate_warning_days }} days"
+          - "Certificate Warning  : {{ certificate_warning_days | int }} days"
 
-          - "Certificate Critical : {{ certificate_critical_days }} days"
+          - "Certificate Critical : {{ certificate_critical_days | int }} days"
 
           - "=============================================================="
 
@@ -905,7 +961,7 @@
 
 
     # ============================================================
-    # 32. LINUX SERVICE DETAILS
+    # 33. LINUX SERVICE DETAILS
     # ============================================================
 
     - name: Display Linux service details
@@ -919,7 +975,7 @@
 
 
     # ============================================================
-    # 33. SAP PROCESS DETAILS
+    # 34. SAP PROCESS DETAILS
     # ============================================================
 
     - name: Display SAP process details
@@ -935,7 +991,7 @@
 
 
     # ============================================================
-    # 34. SAP SYSTEM DETAILS
+    # 35. SAP SYSTEM DETAILS
     # ============================================================
 
     - name: Display SAP system details
@@ -951,7 +1007,7 @@
 
 
     # ============================================================
-    # 35. CERTIFICATE DETAILS
+    # 36. CERTIFICATE DETAILS
     # ============================================================
 
     - name: Display certificate details
@@ -973,7 +1029,7 @@
               (
                 certificate_days_results.results
                 |
-                selectattr('item', 'equalto', item.item)
+                selectattr('item.name', 'equalto', item.item.name)
                 |
                 map(attribute='stdout')
                 |
@@ -981,7 +1037,7 @@
                 |
                 default('UNKNOWN')
               )
-            }}
+            }}"
 
       loop: "{{ certificate_results.results }}"
 
@@ -989,7 +1045,7 @@
 
 
     # ============================================================
-    # 36. FILESYSTEM DETAILS
+    # 37. FILESYSTEM DETAILS
     # ============================================================
 
     - name: Display filesystem details
@@ -999,7 +1055,7 @@
 
 
     # ============================================================
-    # 37. NETWORK INTERFACE DETAILS
+    # 38. NETWORK INTERFACE DETAILS
     # ============================================================
 
     - name: Display network interfaces

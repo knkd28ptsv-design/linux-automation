@@ -104,38 +104,45 @@
     ansible.builtin.set_fact:
       disk_status: "{{\n  'FAIL'\n  if (\n    disk_report\n    | selectattr('usage_pct', 'ge', disk_critical | float)\n    | list\n    | length > 0\n  )\n  else 'WARNING'\n  if (\n    disk_report\n    |\
         \ selectattr('usage_pct', 'ge', disk_warning | float)\n    | list\n    | length > 0\n  )\n  else 'PASS'\n}}"
+  - name: Initialize root filesystem details
+    ansible.builtin.set_fact:
+      root_disk_total_gb: 0
+      root_disk_used_gb: 0
+      root_disk_free_gb: 0
   - name: Set root filesystem details
     ansible.builtin.set_fact:
-      root_disk_total_gb: "{{\n  (\n    disk_report\n    | selectattr('mount', 'equalto', '/')\n    | map(attribute='total_gb')\n    | list\n    | first\n    | default(0)\n  ) | float\n}}"
-      root_disk_used_gb: "{{\n  (\n    disk_report\n    | selectattr('mount', 'equalto', '/')\n    | map(attribute='used_gb')\n    | list\n    | first\n    | default(0)\n  ) | float\n}}"
-      root_disk_free_gb: "{{\n  (\n    disk_report\n    | selectattr('mount', 'equalto', '/')\n    | map(attribute='free_gb')\n    | list\n    | first\n    | default(0)\n  ) | float\n}}"
-  - name: Collect network interface details
-    ansible.builtin.shell: 'ip -o -br addr show | awk ''{printf "%s|%s|%s\n",$1,$2,$3}''
-
-      '
+      root_disk_total_gb: "{{ item.total_gb | float }}"
+      root_disk_used_gb: "{{ item.used_gb | float }}"
+      root_disk_free_gb: "{{ item.free_gb | float }}"
+    loop: "{{ disk_report | default([]) }}"
+    when: item.mount | default('') == '/'
+  - name: Collect network interface and traffic details
+    ansible.builtin.shell: |
+      while IFS='|' read -r iface rx tx; do
+        [ -z "$iface" ] && continue
+        state=$(ip -o -br link show "$iface" 2>/dev/null | awk '{print $2}')
+        addresses=$(ip -o -br addr show "$iface" 2>/dev/null | awk '{for(i=3;i<=NF;i++) printf "%s%s", (i==3?"":" "), $i}')
+        printf '%s|%s|%s|%s|%s\n' "$iface" "${state:-UNKNOWN}" "${addresses:-}" "$rx" "$tx"
+      done < <(awk -F'[: ]+' 'NR>2 && $2!="" {printf "%s|%s|%s\n",$2,$3,$11}' /proc/net/dev)
     args:
       executable: /bin/bash
-    register: network_interfaces_raw
+    register: network_combined_raw
     changed_when: false
     failed_when: false
-  - name: Collect network traffic counters
-    ansible.builtin.shell: "awk -F'[: ]+' 'NR>2 && $2!=\"\" {\n  printf \"%s|%d|%d\\n\",$2,$3,$11\n}' /proc/net/dev\n"
-    args:
-      executable: /bin/bash
-    register: network_traffic_raw
-    changed_when: false
-    failed_when: false
-  - name: Build network report
+  - name: Initialize network reports
     ansible.builtin.set_fact:
-      network_report: "{{\n  network_report | default([]) + [{\n    'interface': item.split('|')[0],\n    'state': item.split('|')[1],\n    'addresses': item.split('|')[2] | default('')\n  }]\n}}"
-    loop: '{{ network_interfaces_raw.stdout_lines | default([]) }}'
-    when: item | trim | length > 0
+      network_report: []
+      network_traffic_report: []
+  - name: Build network report with traffic counters
+    ansible.builtin.set_fact:
+      network_report: "{{ network_report + [{ 'interface': item.split('|')[0], 'state': item.split('|')[1] | default('UNKNOWN'), 'addresses': item.split('|')[2] | default(''), 'rx_mb': ((item.split('|')[3] | int) / 1024 / 1024) | round(2), 'tx_mb': ((item.split('|')[4] | int) / 1024 / 1024) | round(2) }] }}"
+    loop: "{{ network_combined_raw.stdout_lines | default([]) }}"
+    when: item.split('|') | length >= 5
   - name: Build network traffic report
     ansible.builtin.set_fact:
-      network_traffic_report: "{{\n  network_traffic_report | default([]) + [{\n    'interface': item.split('|')[0],\n    'rx_mb': ((item.split('|')[1] | int) / 1024 / 1024) | round(2),\n    'tx_mb': ((item.split('|')[2]\
-        \ | int) / 1024 / 1024) | round(2)\n  }]\n}}"
-    loop: '{{ network_traffic_raw.stdout_lines | default([]) }}'
-    when: item | trim | length > 0
+      network_traffic_report: "{{ network_traffic_report + [{ 'interface': item.interface, 'rx_mb': item.rx_mb, 'tx_mb': item.tx_mb }] }}"
+    loop: "{{ network_report | default([]) }}"
+    when: network_report | default([]) | length > 0
   - name: Collect logged in users
     ansible.builtin.command: who
     register: logged_users_raw
@@ -534,9 +541,7 @@
 
         {% for n in network_report|default([]) %}
 
-        {% set tr = network_traffic_report|default([])|selectattr(''interface'',''equalto'',n.interface)|list|first %}
-
-        <tr><td>{{ n.interface }}</td><td>{{ n.state }}</td><td>{{ n.addresses }}</td><td>{{ tr.rx_mb if tr else 0 }}</td><td>{{ tr.tx_mb if tr else 0 }}</td></tr>
+        <tr><td>{{ n.interface }}</td><td>{{ n.state }}</td><td>{{ n.addresses | default('''') }}</td><td>{{ n.rx_mb | default(0) }}</td><td>{{ n.tx_mb | default(0) }}</td></tr>
 
         {% endfor %}</table></div>
 
